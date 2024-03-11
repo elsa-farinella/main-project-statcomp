@@ -1,0 +1,1963 @@
+---
+title: "Math 517 - Main Project"
+author: "Federico Di Gennaro, Elsa Farinella, Marco Scialanga"
+toc: true
+format: 
+  pdf: 
+    keep-tex: true
+    geometry: ["left=0.7in", "right=0.7in", "top=0.7in", "bottom=1in"]
+  html: default
+editor: visual
+execute:
+  echo: false
+  warning: false
+  error: false
+bibliography: bibliography.bib 
+csl: ieee.csl
+link-citations: true
+number-sections: true
+---
+
+\newpage
+
+# Introduction {#sec-intro}
+
+The Expectation-Maximization (EM) algorithm is an iterative method used to perform maximum likelihood estimation in the presence of missing data, or when it might be helpful to think of our data as if there were some latent variables (e.g., when estimating mixture distributions) [@classwebsite]. The algorithm first estimates the unobserved values (the $\textit{expectation}$ step), then optimizes the likelihood (the $\textit{maximization}$ step), repeating these two steps until convergence to a stationary point.
+
+In this project, our goal is to investigate when the EM algorithm is a good option for statistical inference in the presence of missing data. To answer this question, we will consider different percentages and mechanisms of missing data and apply the EM algorithm for various tasks. In @sec-section1, we generate observations from the multivariate normal distribution, introduce NA's and then apply the EM algorithm to estimate the mean vector $\mu$, the covariance matrix $\Sigma$ and the weight vector $\beta$ in linear and logistic regression settings. In @sec-section2, we generate data in a similar way and then compare the performances of the EM algorithm in terms of parameter estimates with those obtained with maximum likelihood after imputation.
+
+```{r, message = F}
+#| warning: False
+# import necessary libraries
+suppressWarnings(library(Amelia))
+suppressWarnings(library(devtools))
+suppressWarnings(library(dplyr))
+suppressWarnings(library(ggplot2))
+suppressWarnings(library(ggpubr))
+suppressWarnings(library(gridExtra))
+suppressWarnings(library(MASS))
+suppressWarnings(library(mice))
+suppressWarnings(library(misaem))
+suppressWarnings(library(missForest))
+suppressWarnings(library(missMDA))
+suppressWarnings(library(missMethods))
+suppressWarnings(library(naniar))
+suppressWarnings(library(norm))
+suppressWarnings(library(softImpute))
+suppressWarnings(library(tidyr))
+suppressWarnings(library(VIM))
+suppressPackageStartupMessages(require(MASS)) 
+suppressPackageStartupMessages(require(norm)) 
+suppressPackageStartupMessages(require(VIM)) 
+suppressPackageStartupMessages(require(ggplot2)) 
+suppressPackageStartupMessages(require(naniar)) 
+
+source('https://raw.githubusercontent.com/R-miss-tastic/website/master/static/how-to/generate/amputation.R')
+
+source('https://raw.githubusercontent.com/R-miss-tastic/website/master/static/how-to/impute/CrossValidation_softImpute.R')
+
+# Functions to generate missing data 
+generate_data_2col <- function(data, miss_perc, mechanism) {
+  colnames(data) <- c("X1", "X2")
+  
+  if (mechanism == "MCAR") {
+    data <- delete_MCAR(data, miss_perc, c("X1", "X2"))
+  } 
+  
+  if (mechanism == "MAR") {
+    data <- delete_MAR_censoring(data, miss_perc, "X1", "X2")
+  } 
+  
+  if (mechanism == "MNAR") {
+    data <- delete_MNAR_censoring(data, miss_perc, c("X1", "X2"))
+  }
+  data
+}
+
+generate_data <- function(data, miss_perc, mechanism) {
+  colnames(data) <- c("X1", "X2", "X3", "X4")
+  
+  if (mechanism == "MCAR") {
+    data <- delete_MCAR(data, miss_perc, c("X1", "X2", "X3", "X4"))
+  } 
+  
+  if (mechanism == "MAR") {
+    data <- delete_MAR_censoring(data, miss_perc, "X1", "X2")
+  } 
+  
+  if (mechanism == "MNAR") {
+    data <- delete_MNAR_censoring(data, miss_perc, 
+                                  c("X1", "X2", "X3", "X4"))
+  }
+  data
+}
+
+# Function to calculate confidence interval for a vector
+calculate_confidence_interval <- function(x) {
+  result <- t.test(x, conf.level = 0.95)$conf.int
+  return(result)
+}
+```
+
+## Missing Data Mechanisms {#sec-missing-data-mechanisms}
+
+The most well-known missing data mechanisms are the three introduced in [@rub1976]: *Missing Completely at Random* (MCAR), *Missing at Random* (MAR), *Missing not at Random* (MNAR).
+
+When dealing with missing values, we divide our data matrix $X$ in its observed part $X_{OBS}$ and its missing part $X_{MIS}$: $X=(X_{OBS}, X_{MIS})$. For any vector of data $X$ (i.e. the column of a dataset), we can also introduce the random variable $M \in \{0,1\}^n$ such that $M_i=1$ if $X_i$ is missing and $M_i=0$ otherwise. The mechanism will depend on the distribution of M. We can now present the definitions of the three missing data mechanisms mentioned above by describing for each of them the relationship between $X_{OBS},\ X_{MIS},\ M$.
+
+\
+**MCAR**: We have MCAR data when the probability of a value being missing is independent from $(X_{OBS}, X_{MIS})$, hence if: $\mathbb{P}_M(M|X_{OBS},X_{MIS})=\mathbb{P}_M(M) \ \forall X_{OBS}, X_{MIS}.$*\
+***MAR:** We have MAR data when the probability of a value being missing is dependent on the observed values $X_{OBS}$, but not on $X_{MIS}$. Formally, $\mathbb{P}_M(M|X_{OBS},X_{MIS})=\mathbb{P}_M(M|X_{OBS})\ \forall X_{MIS}.$\
+**MNAR:** We have MNAR data in all other cases, i.e., when the probability of a value being missing depends on the unobserved data.
+
+In @fig-mechs, we can see how data can change after introducing NA's in the first variable with the MCAR, MAR, and MNAR mechanisms: for MCAR, the distribution is not heavily affected; for MAR and MNAR, on the other hand, the data looks very different from its original shape (note: there are infinitely many ways to produce MAR and MNAR data, in this project we used the functions from the $\texttt{missMethods}$ library [@censoring] and the function $\texttt{produce\_na}$, which internally calls $\texttt{ampute}$ from the $\texttt{mice}$ package [@producena]). This will cause the EM algorithm to perform more poorly when faced with these last two mechanisms.
+
+In this project, we will investigate the behavior and performance of EM when faced with all three of these missing data mechanisms.
+
+```{r fig.pos="H", fig.width= 7, fig.height=5, out.width="80%"}
+#| label: fig-mechs
+#| fig-cap: Visualization of data distribution before and after introducing missing data with the MCAR, MAR, and MNAR mechanisms.
+
+mu <- c(0, 0)
+sigma <- matrix(c(1, 0.8, 0.8, 1), nrow = 2)
+data <- mvrnorm(n = 1000, mu = mu, Sigma = sigma)
+data <- data.frame(X1 = data[, 1], X2 = data[, 2])
+data_mcar <- data
+data_mar <- data
+data_mnar <- data
+data_mcar[,1] <- delete_MCAR(data, p = 0.3, "X1")[, 1]
+data_mar[,1] <- delete_MAR_censoring(data, p = 0.3, "X1", cols_ctrl = "X2")[, 1]
+data_mnar[,1] <- delete_MNAR_censoring(data, p = 0.3, "X1")[, 1]
+# Set up the plots using ggplot2
+limits <- c(-2.5,3)
+original_plot <- ggplot(data, aes(x = X1, y = X2)) +
+  geom_point(color = "black") +
+  labs(title = "Original Data", x = "X1", y = "X2") +
+  coord_cartesian(xlim = limits, ylim = limits) +
+  theme_minimal()
+
+mcar_plot <- ggplot(data_mcar, aes(x = X1, y = X2)) +
+  geom_point(color = "blue") +
+  labs(title = "MCAR Data", x = "X1", y = "X2") +
+  coord_cartesian(xlim = limits, ylim = limits) +
+  theme_minimal()
+
+mar_plot <- ggplot(data_mar, aes(x = X1, y = X2)) +
+  geom_point(color = "red") +
+  labs(title = "MAR Data", x = "X1", y = "X2") +
+  coord_cartesian(xlim = limits, ylim = limits) +
+  theme_minimal()
+
+mnar_plot <- ggplot(data_mnar, aes(x = X1, y = X2)) +
+  geom_point(color = "green") +
+  labs(title = "MNAR Data", x = "X1", y = "X2") +
+  coord_cartesian(xlim = limits, ylim = limits) +
+  theme_minimal()
+
+# Arrange the plots in a 2x2 grid
+title <- text_grob("Distribution of Data Before and After Introducing NA's with Different Mechanisms", size=12.5, face="bold")
+grid.arrange(original_plot, mcar_plot, mar_plot, mnar_plot, ncol = 2, top = title)
+```
+
+# Performance of EM with Missing Data on Different Tasks {#sec-section1}
+
+As previously mentioned, the EM algorithm is an effective technique that is often used to perform MLE with missing data. In this section, we analyze how EM behaves when dealing with different proportions of missing values in the design matrix $X$, in three different frameworks:
+
+1\) *EM for Gaussian data:* Estimate the parameters $\mu$ and $\Sigma$ of a multivariate normal distribution.
+
+2\) *EM for Linear Regression:* Estimate the parameters $\beta$ of a linear regression model where the design matrix $X$ is such that $X_i \sim \mathcal{N}_p(\mu, \Sigma), \ i=1,...,n.$
+
+3\) *EM for Logistic Regression:* Estimate the parameters $\beta$ of a logistic regression model where the design matrix $X$ is such that $X_i \sim \mathcal{N}_p(\mu, \Sigma), \ i=1,...,n.$
+
+In all three cases, we evaluate the performance of the EM algorithm with the root mean squared error (RMSE), defined, taking $\beta \in \mathbb{R}^d$ as the true parameter and denoting the EM estimate by $\beta_{EM}$, as: $$RMSE = \sqrt{MSE} = \sqrt{\frac{1}{d}\sum_{i=1}^d (\beta_{EM,i}-\beta_{i})^2},$$
+
+and analogously for matrices in $\mathbb{R}^{m\times n}$ (as in the case of $\Sigma$).
+
+One aspect that we noticed when we began performing the experiments described above is that the accuracy of EM estimates varies significantly even for the same missing data percentage and mechanism. This can be easily explained: for example, with MCAR data and mean estimation for multivariate normal, we could have data missing symmetrically around the mean, so that mean estimation won't be affected much. However, it could also happen that a lot of the missing data is on one side of the true mean, thus heavily worsening the performance of mean estimation. Consequently, in order to generate informative visualizations, we repeat EM estimation several times (ranging from 15 to 600 depending on the experiment) for each incomplete data setting and average the $RMSE$'s obtained in each simulation. To conclude the introduction, it is important to note that the results obtained with the MAR and MNAR mechanisms should not be considered valid $\textit{for all MAR and MNAR settings}$. As mentioned in the introduction, there are infinitely many ways to produce MAR and MNAR data. Some ways, of course, could cause the EM algorithm to perform worse or better than others. For example, in the case of mean estimation with MNAR data, if the missing values are introduced symmetrically around the mean by systematically removing the lowest and highest values, mean estimation won't be affected much. Thus, the right way to interpret results for MAR and MNAR data in @sec-section1 is that, for incomplete data generated with these mechanisms, the performance of EM can be $\textit{at least as bad}$ as the one we present in this project.
+
+## EM for Mean and Covariance Estimation
+
+In this subsection, we will use the EM algorithm to estimate the mean $\mu$ and covariance matrix $\Sigma$ of multivariate normal data $X$ with missing values generated with the three mechanisms described in @sec-missing-data-mechanisms. We begin by generating $n = 300$ observations from the multivariate normal distribution with $\mu = (1,2)^T, \ \Sigma = \begin{bmatrix} 1 & 0.8 \\ 0.8 & 1 \end{bmatrix}$. We will analyze how interesting patterns arise when dealing with more than two variables in @sec-depthone.
+
+Below we plot the densities generated with the estimated $\mu$ and $\Sigma$ when $25\%$ of the data is missing and the $RMSE$ obtained with the EM algorithm when dealing with the three different mechanisms for both $\mu$ and $\Sigma$ and percentages of missing data ranging from $5%$ to $70\%$. We also plot the errors obtained with sample mean and sample covariance (dashed lines). We computed the latter by only keeping complete rows. Recall that these graphs are obtained by averaging over several (in this case: 200) repetitions of the same experiment. Thus, here and wherever else in the project the overall appearance of the plot is not negatively affected, we also plot the $95\%$ confidence intervals (CI's) to show that the curves we obtain are representatitve of the true expected value of the results.
+
+```{r}
+# -------------- MCAR -----------------
+set.seed(1)
+K <- 100 # number of plots to average (decrease to make code run quicker, increase for smoother plots)
+n <- 300 # number of observations (decrease to make code run quicker, increase for better plots)
+P <- 14 # max percentage of missing data to test EM on
+
+mu_err_MCAR <- numeric(P)
+sigma_err_MCAR <- numeric(P)
+mu_err_MCAR_matrix <- matrix(0, nrow = K, ncol = P)
+sigma_err_MCAR_matrix <- matrix(0, nrow = K, ncol = P)
+mu_err_SM_MCAR <- numeric(P)
+sigma_err_SC_MCAR <- numeric(P)
+
+perc <- numeric(P)
+mu <- c(1, 2)
+sigma <- matrix(c(1, 0.8, 0.8, 1), nrow = 2)
+
+for (j in 1:K) {
+  
+  for (i in 0:P) {
+    data <- mvrnorm(n = n, mu = mu, Sigma = sigma)
+    data <- data.frame(X1 = data[, 1], X2 = data[, 2])
+    data_mcar <- generate_data_2col(data, 0.05*i, "MCAR")
+    perc[i] <- 0.05*i
+    s_mcar <- prelim.norm(cbind(data_mcar$X1, data_mcar$X2))
+    invisible(capture.output(thetahat_mcar <- em.norm(s_mcar, showits = FALSE)))
+    pars_mcar <- getparam.norm(s_mcar, thetahat_mcar)
+    
+    mu_err_MCAR_matrix[j,i] <- sqrt(mean((mu-pars_mcar$mu)^2))
+    sigma_err_MCAR_matrix[j,i] <- sqrt(mean((sigma-pars_mcar$sigma)^2))
+    
+    mu_err_MCAR[i] <- mu_err_MCAR[i] + sqrt(mean((mu-pars_mcar$mu)^2))
+    sigma_err_MCAR[i] <- sigma_err_MCAR[i] + sqrt(mean((sigma-pars_mcar$sigma)^2))
+    
+    mu_err_SM_MCAR[i] <- mu_err_SM_MCAR[i] + sqrt(mean((mu-colMeans(data_mcar, na.rm = T))^2))
+    sigma_data <- data_mcar[complete.cases(data_mcar),]
+    sigma_err_SC_MCAR[i] <- sigma_err_SC_MCAR[i] + sqrt(mean((sigma-cov(sigma_data))^2))
+    if (i == 5) {
+      mu_MCAR25 <- pars_mcar$mu
+      sigma_MCAR25 <- pars_mcar$sigma
+    }
+  }
+}
+
+lower_mu_MCAR <- c()
+upper_mu_MCAR <- c()
+lower_sigma_MCAR <- c()
+upper_sigma_MCAR <- c()
+
+# Apply the function to each column of the matrix
+confidence_intervals_mu <- apply(mu_err_MCAR_matrix, 2, calculate_confidence_interval)
+
+confidence_intervals_sigma <- apply(sigma_err_MCAR_matrix, 2, calculate_confidence_interval)
+
+for (i in 1:P){
+  lower_mu_MCAR <- c(lower_mu_MCAR, confidence_intervals_mu[1,i])
+  upper_mu_MCAR <- c(upper_mu_MCAR, confidence_intervals_mu[2,i])
+  
+  lower_sigma_MCAR <- c(lower_sigma_MCAR, confidence_intervals_sigma[1,i])
+  upper_sigma_MCAR <- c(upper_sigma_MCAR, confidence_intervals_sigma[2,i])
+}
+```
+
+```{r}
+# -------------- MAR -----------------
+set.seed(1)
+mu_err_MAR <- numeric(P)
+sigma_err_MAR <- numeric(P)
+mu_err_MAR_matrix <- matrix(0, nrow = K, ncol = P)
+sigma_err_MAR_matrix <- matrix(0, nrow = K, ncol = P)
+mu_err_SM_MAR <- numeric(P)
+sigma_err_SC_MAR <- numeric(P)
+
+for (j in 1:K) {
+  
+  for (i in 1:P) {
+    data <- mvrnorm(n = n, mu = mu, Sigma = sigma)
+    data <- data.frame(X1 = data[, 1], X2 = data[, 2])
+    data_mar <- data
+    data_mar[,1] <- delete_MAR_censoring(data, p = 0.05*i, "X1", cols_ctrl = "X2")[, 1]
+    data_mar[,2] <- delete_MAR_censoring(data, p = 0.05*i, "X2", cols_ctrl = "X1")[, 2]
+    
+    s_mar <- prelim.norm(cbind(data_mar$X1, data_mar$X2))
+    invisible(capture.output(thetahat_mar <- em.norm(s_mar, showits = FALSE)))
+    pars_mar <- getparam.norm(s_mar, thetahat_mar)
+    
+    mu_err_MAR_matrix[j,i] <- sqrt(mean((mu-pars_mar$mu)^2))
+    sigma_err_MAR_matrix[j,i] <- sqrt(mean((sigma-pars_mar$sigma)^2))
+    
+    mu_err_MAR[i] <- mu_err_MAR[i] + sqrt(mean((mu-pars_mar$mu)^2))
+    sigma_err_MAR[i] <- sigma_err_MAR[i] + sqrt(mean((sigma-pars_mar$sigma)^2))
+    mu_err_SM_MAR[i] <- mu_err_SM_MAR[i] + sqrt(mean((mu-colMeans(data_mar, na.rm = T))^2))
+    sigma_data <- data_mar[complete.cases(data_mar),]
+    sigma_err_SC_MAR[i] <- sigma_err_SC_MAR[i] + sqrt(mean((sigma-cov(sigma_data))^2))
+    
+    if (i == 5) {
+      mu_MAR25 <- pars_mar$mu
+      sigma_MAR25 <- pars_mar$sigma
+    }
+  }
+}
+
+lower_mu_MAR <- c()
+upper_mu_MAR <- c()
+lower_sigma_MAR <- c()
+upper_sigma_MAR <- c()
+
+# Apply the function to each column of the matrix
+confidence_intervals_mu <- apply(mu_err_MAR_matrix, 2, calculate_confidence_interval)
+
+confidence_intervals_sigma <- apply(sigma_err_MAR_matrix, 2, calculate_confidence_interval)
+
+for (i in 1:P){
+  lower_mu_MAR <- c(lower_mu_MAR, confidence_intervals_mu[1,i])
+  upper_mu_MAR <- c(upper_mu_MAR, confidence_intervals_mu[2,i])
+  
+  lower_sigma_MAR <- c(lower_sigma_MAR, confidence_intervals_sigma[1,i])
+  upper_sigma_MAR <- c(upper_sigma_MAR, confidence_intervals_sigma[2,i])
+}
+```
+
+```{r}
+# -------------- MNAR -----------------
+set.seed(2)
+mu_err_MNAR <- numeric(P)
+sigma_err_MNAR <- numeric(P)
+mu_err_MNAR_matrix <- matrix(0, nrow = K, ncol = P)
+sigma_err_MNAR_matrix <- matrix(0, nrow = K, ncol = P)
+mu_err_SM_MNAR <- numeric(P)
+sigma_err_SC_MNAR <- numeric(P)
+
+for (j in 1:K) {
+  
+  for (i in 1:P) {
+    data <- mvrnorm(n = n, mu = mu, Sigma = sigma)
+    data <- data.frame(X1 = data[, 1], X2 = data[, 2])
+    data_mnar <- data
+    data_mnar[,1] <- delete_MNAR_censoring(data, p = 0.05*i, "X1")[, 1]
+    data_mnar[,2] <- delete_MNAR_censoring(data, p = 0.05*i, "X2")[, 2]
+    s_mnar <- prelim.norm(cbind(data_mnar$X1, data_mnar$X2))
+    invisible(capture.output(thetahat_mnar <- em.norm(s_mnar, showits = FALSE)))
+    pars_mnar <- getparam.norm(s_mnar, thetahat_mnar)
+    
+    mu_err_MNAR_matrix[j,i] <- sqrt(mean((mu-pars_mnar$mu)^2))
+    sigma_err_MNAR_matrix[j,i] <- sqrt(mean((sigma-pars_mnar$sigma)^2))
+    
+    mu_err_MNAR[i] <- mu_err_MNAR[i] + sqrt(mean((mu-pars_mnar$mu)^2))
+    sigma_err_MNAR[i] <- sigma_err_MNAR[i] + sqrt(mean((sigma-pars_mnar$sigma)^2))
+    
+    mu_err_SM_MNAR[i] <- mu_err_SM_MNAR[i] + sqrt(mean((mu-colMeans(data_mnar, na.rm = T))^2))
+    sigma_data <- data_mnar[complete.cases(data_mnar),]
+    sigma_err_SC_MNAR[i] <- sigma_err_SC_MNAR[i] + sqrt(mean((sigma-cov(sigma_data))^2))
+    if (i == 5) {
+      mu_MNAR25 <- pars_mar$mu
+      sigma_MNAR25 <- pars_mar$sigma
+    }
+  }
+}
+
+lower_mu_MNAR <- c()
+upper_mu_MNAR <- c()
+lower_sigma_MNAR <- c()
+upper_sigma_MNAR <- c()
+
+# Apply the function to each column of the matrix
+confidence_intervals_mu <- apply(mu_err_MNAR_matrix, 2, calculate_confidence_interval)
+
+confidence_intervals_sigma <- apply(sigma_err_MNAR_matrix, 2, calculate_confidence_interval)
+
+for (i in 1:P){
+  lower_mu_MNAR <- c(lower_mu_MNAR, confidence_intervals_mu[1,i])
+  upper_mu_MNAR <- c(upper_mu_MNAR, confidence_intervals_mu[2,i])
+  
+  lower_sigma_MNAR <- c(lower_sigma_MNAR, confidence_intervals_sigma[1,i])
+  upper_sigma_MNAR <- c(upper_sigma_MNAR, confidence_intervals_sigma[2,i])
+}
+```
+
+```{r, fig.width= 7, fig.height=5, out.width="80%"}
+#| label: fig-estdens
+#| fig-cap: Original and estimated densities with EM applied on incomplete datasets generated by the three mechanisms with 25% of missing data.
+
+data_true <- data.frame(mvrnorm(n=10000, mu = mu, Sigma = sigma))
+
+data_mcar <- data.frame(mvrnorm(n=10000, mu = mu_MCAR25, Sigma = sigma_MCAR25))
+
+data_mar <- data.frame(mvrnorm(n=10000, mu = mu_MAR25, Sigma = sigma_MAR25))
+
+data_mnar <- data.frame(mvrnorm(n=10000, mu = mu_MNAR25, Sigma = sigma_MNAR25))
+
+limits <- c(-1.5, 4.5)
+
+plot_true <- ggplot(data_true, aes(x = X1, y = X2)) +
+  coord_cartesian(xlim = limits, ylim = limits) +
+  stat_density_2d(aes(fill = ..level..), geom = "polygon") +
+  labs(title = "Original Density", fill="Density")
+
+plot_mcar <- ggplot(data_mcar, aes(x = X1, y = X2)) +
+  coord_cartesian(xlim = limits, ylim = limits) +
+  stat_density_2d(aes(fill = ..level..), geom = "polygon") +
+  labs(title = "MCAR", fill="Density")
+
+plot_mar <- ggplot(data_mar, aes(x = X1, y = X2)) +
+  coord_cartesian(xlim = limits, ylim = limits) +
+  stat_density_2d(aes(fill = ..level..), geom = "polygon") +
+  labs(title = "MAR", fill="Density")
+
+plot_mnar <- ggplot(data_mnar, aes(x = X1, y = X2)) +
+  coord_cartesian(xlim = limits, ylim = limits) +
+  stat_density_2d(aes(fill = ..level..), geom = "polygon") +
+  labs(title = "MNAR", fill="Density")
+
+# Arrange the plots in a 2x2 grid
+title_grid <- text_grob("True and Estimated Densities with 25% of Missing Data", size=13, face="bold")
+grid.arrange(plot_true, plot_mcar, plot_mar, plot_mnar, ncol = 2, top = title_grid)
+```
+
+In @fig-estdens, we can see how MAR and MNAR data make the EM algorithm perform much more poorly, with their estimated density already being far from the original one. On the other hand, the density generated by $\mu_{EM}$ and $\Sigma_{EM}$ after introducing NA's through the MCAR mechanism is quite similar to the true one.
+
+```{r, fig.width= 7, fig.height=5, out.width="80%"}
+#| label: fig-mu
+#| fig-cap: RMSE of $\mu_{EM}$ (solid) and sample mean (dashed) for the three different mechanisms as the percentage of missing data grows, with 95% confidence intervals.
+# Create ggplot objects
+data_MCAR <- data.frame(perc, mu_err_MCAR/K, lower_mu_MCAR, upper_mu_MCAR)
+data_MAR <- data.frame(perc, mu_err_MAR/K, lower_mu_MAR, upper_mu_MAR)
+data_MNAR <- data.frame(perc, mu_err_MNAR/K, lower_mu_MNAR, upper_mu_MNAR)
+data_SM_MCAR <- data.frame(perc, mu_err_SM_MCAR/K)
+data_SM_MAR <- data.frame(perc, mu_err_SM_MAR/K)
+data_SM_MNAR <- data.frame(perc, mu_err_SM_MNAR/K)
+size <- 0.8
+
+plot_MCAR <- ggplot(data_MCAR, aes(x = perc, y = mu_err_MCAR/K)) +
+  geom_ribbon(aes(ymin = lower_mu_MCAR, ymax = upper_mu_MCAR, fill = "MCAR"), alpha = 0.1) +
+  geom_line(aes(color = "MCAR", linetype = "MCAR"), size = size) 
+
+# Combine plots into a single figure with overlapped layers
+combined_plot <- plot_MCAR +
+  geom_line(data = data_SM_MCAR, aes(x = perc, y = mu_err_SM_MCAR.K, color = "SM_MCAR", linetype = "SM_MCAR"), size = size) +
+  geom_ribbon(data = data_MAR, aes(x = perc, ymin = lower_mu_MAR, ymax = upper_mu_MAR, fill = "MAR"), alpha = 0.1) +
+  geom_line(data = data_MAR, aes(x = perc, y = mu_err_MAR.K, color = "MAR", linetype = "MAR"), size = size) +
+  geom_line(data = data_SM_MAR, aes(x = perc, y = mu_err_SM_MAR.K, color = "SM_MAR", linetype = "SM_MAR"), size = size) +
+  geom_ribbon(data = data_MNAR, aes(x = perc, ymin = lower_mu_MNAR, ymax = upper_mu_MNAR, fill = "MNAR"), alpha = 0.1) +
+  geom_line(data = data_MNAR, aes(x = perc, y = mu_err_MNAR.K, color = "MNAR", linetype = "MNAR"), size = size) +
+  geom_line(data = data_SM_MNAR, aes(x = perc, y = mu_err_SM_MNAR.K, color = "SM_MNAR", linetype = "SM_MNAR"), size = size) +
+  labs(title = expression(bold("RMSE of " * mu[EM] * " and Sample Mean vs. Proportion of Missing Data")), x = "Proportion of Missing Data", y = "RMSE") +
+  scale_color_manual("RMSE", values = c("MCAR"="blue", "MAR" = "red","MNAR" = "green",  "SM_MCAR" = "purple", "SM_MAR" = "darkorange", "SM_MNAR" = "darkgreen"), labels=c("MCAR", "MAR", "MNAR", "SM_MCAR", "SM_MAR", "SM_MNAR"), breaks = c("MCAR", "MAR", "MNAR", "SM_MCAR", "SM_MAR", "SM_MNAR")) +
+  scale_linetype_manual("RMSE", values = c("MCAR" = "solid", "MAR" = "solid", "MNAR" = "solid", "SM_MCAR" = "dashed", "SM_MAR" = "dashed", "SM_MNAR" = "dashed"), labels=c("MCAR", "MAR", "MNAR", "SM_MCAR", "SM_MAR", "SM_MNAR"), breaks = c("MCAR", "MAR", "MNAR", "SM_MCAR", "SM_MAR", "SM_MNAR")) +
+  scale_fill_manual("Confidence Interval", values = c("MCAR"="blue", "MAR"="red", "MNAR"="green"), labels=c("MCAR", "MAR", "MNAR"), breaks = c("MCAR", "MAR", "MNAR")) +
+  scale_x_continuous(breaks = c(0.05, 0.25, 0.5, 0.7)) +
+  theme_minimal()
+
+# Print the combined plot
+print(combined_plot)
+```
+
+```{r, fig.width= 7, fig.height=5, out.width="80%"}
+#| label: fig-sigma
+#| fig-cap: RMSE of $\Sigma_{EM}$ (solid) and sample covariance (dashed) for the three different mechanisms as the percentage of missing data grows, with 95% confidence intervals.
+# Create ggplot objects
+data_MCAR <- data.frame(perc, sigma_err_MCAR/K, lower_sigma_MCAR, upper_sigma_MCAR)
+data_MAR <- data.frame(perc, sigma_err_MAR/K, lower_sigma_MAR, upper_sigma_MAR)
+data_MNAR <- data.frame(perc, sigma_err_MNAR/K, lower_sigma_MNAR, upper_sigma_MNAR)
+data_SC_MCAR <- data.frame(perc, sigma_err_SC_MCAR/K)
+data_SC_MAR <- data.frame(perc, sigma_err_SC_MAR/K)
+data_SC_MNAR <- data.frame(perc, sigma_err_SC_MNAR/K)
+size <- 0.8
+
+plot_MCAR <- ggplot(data_MCAR, aes(x = perc, y = sigma_err_MCAR/K)) +
+  geom_ribbon(aes(ymin = lower_sigma_MCAR, ymax = upper_sigma_MCAR, fill = "MCAR"), alpha = 0.1) +
+  geom_line(aes(color = "MCAR", linetype = "MCAR"), size = size)
+
+# Combine plots into a single figure with overlapped layers
+combined_plot <- plot_MCAR +
+  geom_line(data = data_SC_MCAR, aes(x = perc, y = sigma_err_SC_MCAR.K, color = "SC_MCAR", linetype = "SC_MCAR"), size = size) +
+  geom_ribbon(data = data_MAR, aes(x = perc, ymin = lower_sigma_MAR, ymax = upper_sigma_MAR, fill = "MAR"), alpha = 0.1) +
+  geom_line(data = data_MAR, aes(x = perc, y = sigma_err_MAR.K, color = "MAR", linetype = "MAR"), size = size) +
+  geom_line(data = data_SC_MAR, aes(x = perc, y = sigma_err_SC_MAR.K, color = "SC_MAR", linetype = "SC_MAR"), size = size) +
+  geom_ribbon(data = data_MNAR, aes(x = perc, ymin = lower_sigma_MNAR, ymax = upper_sigma_MNAR, fill = "MNAR"), alpha = 0.1) +
+  geom_line(data = data_MNAR, aes(x = perc, y = sigma_err_MNAR.K, color = "MNAR", linetype = "MNAR"), size = size) +
+  geom_line(data = data_SC_MNAR, aes(x = perc, y = sigma_err_SC_MNAR.K, color = "SC_MNAR", linetype = "SC_MNAR"), size = size) +
+  labs(title = expression(bold("RMSE of " * Sigma[EM] * " and Sample Covariance vs. Proportion of Missing Data")), y = "RMSE", x="Proportion of Missing Data") +
+  scale_color_manual("RMSE", values = c("MCAR"="blue", "MAR" = "red","MNAR" = "green",  "SC_MCAR" = "purple", "SC_MAR" = "darkorange", "SC_MNAR" = "darkgreen"), labels=c("MCAR", "MAR", "MNAR", "SC_MCAR", "SC_MAR", "SC_MNAR"), breaks = c("MCAR", "MAR", "MNAR", "SC_MCAR", "SC_MAR", "SC_MNAR")) +
+  scale_linetype_manual("RMSE", values = c("MCAR" = "solid", "MAR" = "solid", "MNAR" = "solid", "SC_MCAR" = "dashed", "SC_MAR" = "dashed", "SC_MNAR" = "dashed"), labels=c("MCAR", "MAR", "MNAR", "SC_MCAR", "SC_MAR", "SC_MNAR"), breaks = c("MCAR", "MAR", "MNAR", "SC_MCAR", "SC_MAR", "SC_MNAR")) +
+  scale_fill_manual("Confidence Interval",  values = c("MCAR"="blue", "MAR"="red", "MNAR"="green"), labels=c("MCAR", "MAR", "MNAR"), breaks = c("MCAR", "MAR", "MNAR")) +
+  scale_x_continuous(breaks = c(0.05, 0.25, 0.5, 0.7)) +
+  theme_minimal()
+
+# Print the combined plot
+print(combined_plot)
+```
+
+@fig-mu and @fig-sigma reveal distinct behaviors of the EM algorithm under the three missing data mechanisms: MCAR, MAR, and MNAR. Under the MCAR mechanism, where data is missing indiscriminately, the algorithm's performance is quite satisfactory at all percentages of missing data up to $70\%$, for both mean and covariance estimation. For mean estimation, we can see that the EM algorithm only slightly outperforms simply taking the sample mean; on the other hand, for covariance estimation, especially for larger $(> 0.2)$ percentages of missing data, the EM algorithm clearly tops the simpler approach. One should keep in mind that the EM algorithm is quite more expensive, in computational resources, than simply taking the sample mean and sample covariance. For this reason, for MCAR data and especially for large $n$, if computational resources are an issue, it would seem advisable to only use the EM algorithm for covariance estimation and large percentages of missing data. If efficiency is not a matter of concern, however, the EM algorithm is clearly more accurate for both applications.
+
+Transitioning to the MAR mechanism, the EM algorithm's struggle is more evident, due to the nature of missing data. The RMSE climbs steadily as the percentage of missing data rises. This linear increase hints at a consistent degradation in the quality of the EM estimation as the missing data is related to other observed variables. However, the EM algorithm still does much better than the simpler approaches outlined above: the MAR setting is where the EM algorithm most clearly surpasses simply taking the sample mean and covariance. Furthermore, it is interesting to note that when taking the sample covariance after removing incomplete rows, the trend of the error is equivalent to that of the MNAR case. This is because in this experiment, we only have two columns that condition on each other to generate NA's. Then, eliminating the rows with any of the two columns being empty gives the same result as MNAR data, due to the definition of the functions in the $\texttt{missMethods}$ package as well.
+
+The graph produced using the MNAR mechanism underscores a more severe condition. From the onset, the RMSE for both mean and covariance estimation is elevated and ascends rapidly. This trend illustrates the algorithm's heightened sensitivity when the missingness is related to the unobserved data itself. As the proportion of missing information increases, the RMSE grows substantially, clearly exceeding the errors observed in the other two mechanisms. On the other hand, the error obtained by taking the sample mean and covariance as estimates is not that much higher for low percentages of missing data, and, for covariance estimation, it is even lower for proportions $> 0.3$. This would suggest that, even in the MNAR case, one could also consider sacrificing some accuracy for lower percentages of missing data, in favor of efficiency. For higher percentages, and for covariance estimation in particular, the experiment seems to show that one should avoid the EM algorithm, as it cannot even outperform the other much simpler approach we considered.
+
+When comparing the results, it is clear that the missing data mechanism significantly influences the accuracy of the estimates obtained with EM. The MAR and MNAR conditions, in particular, expose the limitations of the EM algorithm, where the RMSE suggests a more pronounced inaccuracy in the estimation process. On the other hand, the EM algorithm shows resilience under MCAR conditions, even for high percentages of incompleteness. This analysis showcases the critical need to understand and correctly identify the missing data mechanism in statistical modeling to ensure the reliability of the estimates produced.
+
+### A More in Depth Look at how $\Sigma$ Affects EM Performance in Mean Estimation with MAR Data {#sec-depthone}
+
+Limiting our analysis to two variables, however, could prevent us from discovering interesting patterns that only arise when considering the dynamics at play between multiple columns with incomplete information. Thus, we generate multivariate random data with $\mu = (0,0,0,0)^T$ and $\Sigma = \begin{bmatrix} 1 & 0 & 0 & 0 \\ 0 & 1 & 0.5 & 0.9 \\ 0 & 0.5 & 1 & 0.7 \\ 0 & 0.9 & 0.7 & 1 \\ \end{bmatrix}.$ Note that the first variable is independent of all the others. Then, we generate MAR data in column $1$ conditioned on column $2$ (covariance $0$), on column $2$ conditioned on column $3$ (covariance $0.5$), on column $3$ conditioned on column $4$ (covariance $0.7$) and on column $4$ conditioned on column $2$ (covariance $0.9$). We are interested to see how the error of each coordinate of $\mu_{EM}$ will behave, in particular when compared to the more preferable setting of MCAR data.
+
+```{r}
+mu1_err_MAR <- numeric(P)
+mu1_err_MAR_matrix <- matrix(0, nrow = K, ncol = P)
+
+mu2_err_MAR <- numeric(P)
+mu2_err_MAR_matrix <- matrix(0, nrow = K, ncol = P)
+
+mu3_err_MAR <- numeric(P)
+mu3_err_MAR_matrix <- matrix(0, nrow = K, ncol = P)
+
+mu4_err_MAR <- numeric(P)
+mu4_err_MAR_matrix <- matrix(0, nrow = K, ncol = P)
+
+mu1_err_MCAR <- numeric(P)
+mu1_err_MCAR_matrix <- matrix(0, nrow = K, ncol = P)
+
+perc <- numeric(P)
+mu <- c(0, 0, 0, 0)
+
+sigma <- matrix(c(1, 0, 0, 0,
+                  0, 1, 0.5, 0.9,
+                  0, 0.5, 1, 0.7,
+                  0, 0.9, 0.7, 1), ncol = 4)
+for (j in 1:K) {
+  multivariate_data <- mvrnorm(n = n, mu = mu, Sigma = sigma)
+  df <- as.data.frame(multivariate_data)
+  df_mar <- data.frame(matrix(nrow = n, ncol = 4))
+  
+  for (i in 0:P) {
+    p <- 0.05 * i
+    perc[i] <- p
+    
+    df_mar[, 1] <- delete_MAR_censoring(df, p = p, "V1", cols_ctrl = "V2")[, 1]
+    df_mar[, 2] <- delete_MAR_censoring(df, p = p, "V2", cols_ctrl = "V3")[, 2]
+    df_mar[, 3] <- delete_MAR_censoring(df, p = p, "V3", cols_ctrl = "V4")[, 3]
+    df_mar[, 4] <- delete_MAR_censoring(df, p = p, "V4", cols_ctrl = "V2")[, 4]
+   
+    df_mcar <- delete_MCAR(df, p = p, c("V1", "V2", "V3", "V4"))
+    
+    s_mar <- prelim.norm(cbind(df_mar$X1, df_mar$X2, df_mar$X3, df_mar$X4))
+    s_mcar <- prelim.norm(cbind(df_mcar$V1, df_mcar$V2, df_mcar$V3, df_mcar$V4))
+    
+    invisible(capture.output(thetahat_mar <- em.norm(s_mar, showits = FALSE)))
+    invisible(capture.output(thetahat_mcar <- em.norm(s_mcar, showits = FALSE)))
+    
+    pars_mar <- getparam.norm(s_mar, thetahat_mar)
+    pars_mcar <- getparam.norm(s_mcar, thetahat_mcar)
+    
+    mu1_err_MAR[i] <- mu1_err_MAR[i] + sqrt(mean((mu[1] - pars_mar$mu[1])^2))
+    mu1_err_MAR_matrix[j,i] <- sqrt(mean((mu[1] - pars_mar$mu[1])^2))
+    
+    mu2_err_MAR[i] <- mu2_err_MAR[i] + sqrt(mean((mu[2] - pars_mar$mu[2])^2))
+    mu2_err_MAR_matrix[j,i] <- sqrt(mean((mu[2] - pars_mar$mu[2])^2))
+    
+    mu3_err_MAR[i] <- mu3_err_MAR[i] + sqrt(mean((mu[3] - pars_mar$mu[3])^2))
+    mu3_err_MAR_matrix[j,i] <- sqrt(mean((mu[3] - pars_mar$mu[3])^2))
+    
+    mu4_err_MAR[i] <- mu4_err_MAR[i] + sqrt(mean((mu[4] - pars_mar$mu[4])^2))
+    mu4_err_MAR_matrix[j,i] <- sqrt(mean((mu[4] - pars_mar$mu[4])^2))
+      
+    mu1_err_MCAR[i] <- mu1_err_MCAR[i] + sqrt(mean((mu[1] - pars_mcar$mu[1])^2))
+    mu1_err_MCAR_matrix[j,i] <- sqrt(mean((mu[1] - pars_mcar$mu[1])^2))
+
+  }
+}
+
+lower_mu1_MAR <- c()
+upper_mu1_MAR <- c()
+
+lower_mu2_MAR <- c()
+upper_mu2_MAR <- c()
+
+lower_mu3_MAR <- c()
+upper_mu3_MAR <- c()
+
+lower_mu4_MAR <- c()
+upper_mu4_MAR <- c()
+
+lower_mu1_MCAR <- c()
+upper_mu1_MCAR <- c()
+
+# Apply the function to each column of the matrix
+confidence_intervals_mu_1_MAR <- apply(mu1_err_MAR_matrix, 2, calculate_confidence_interval)
+
+confidence_intervals_mu_2_MAR <- apply(mu2_err_MAR_matrix, 2, calculate_confidence_interval)
+
+confidence_intervals_mu_3_MAR <- apply(mu3_err_MAR_matrix, 2, calculate_confidence_interval)
+
+confidence_intervals_mu_4_MAR <- apply(mu4_err_MAR_matrix, 2, calculate_confidence_interval)
+
+confidence_intervals_mu_1_MCAR <- apply(mu1_err_MCAR_matrix, 2, calculate_confidence_interval)
+
+for (i in 1:P){
+  lower_mu1_MAR <- c(lower_mu1_MAR, confidence_intervals_mu_1_MAR[1,i])
+  upper_mu1_MAR <- c(upper_mu1_MAR, confidence_intervals_mu_1_MAR[2,i])
+  
+  lower_mu2_MAR <- c(lower_mu2_MAR, confidence_intervals_mu_2_MAR[1,i])
+  upper_mu2_MAR <- c(upper_mu2_MAR, confidence_intervals_mu_2_MAR[2,i])
+  
+  lower_mu3_MAR <- c(lower_mu3_MAR, confidence_intervals_mu_3_MAR[1,i])
+  upper_mu3_MAR <- c(upper_mu3_MAR, confidence_intervals_mu_3_MAR[2,i])
+  
+  lower_mu4_MAR <- c(lower_mu4_MAR, confidence_intervals_mu_4_MAR[1,i])
+  upper_mu4_MAR <- c(upper_mu4_MAR, confidence_intervals_mu_4_MAR[2,i])
+  
+  lower_mu1_MCAR <- c(lower_mu1_MCAR, confidence_intervals_mu_1_MCAR[1,i])
+  upper_mu1_MCAR <- c(upper_mu1_MCAR, confidence_intervals_mu_1_MCAR[2,i])
+}
+
+```
+
+```{r, fig.width= 7, fig.height=5, out.width="80%"}
+#| label: fig-comparisonone
+#| fig-cap: RMSE of $\mu_i, \ i = 1,\dots,4$ for MAR data and of $\mu_1$ for MCAR data with 95% confidence intervals.
+# Create ggplot objects
+data_mu1_MAR <- data.frame(perc, mu1_err_MAR/K, lower_mu1_MAR, upper_mu1_MAR)
+data_mu2_MAR <- data.frame(perc, mu2_err_MAR/K, lower_mu2_MAR, upper_mu2_MAR)
+data_mu3_MAR <- data.frame(perc, mu3_err_MAR/K, lower_mu3_MAR, upper_mu3_MAR)
+data_mu4_MAR <- data.frame(perc, mu4_err_MAR/K, lower_mu4_MAR, upper_mu4_MAR)
+data_mu1_MCAR <- data.frame(perc, mu1_err_MCAR/K, lower_mu1_MCAR, upper_mu1_MCAR)
+size <- 0.8
+
+plot_mu1_MAR <- ggplot(data_mu1_MAR, aes(x = perc, y = mu1_err_MAR/K)) +
+  geom_ribbon(aes(ymin = lower_mu1_MAR, ymax = upper_mu1_MAR, fill = "mu1_MAR"), alpha = 0.1) +
+  geom_line(aes(color = "mu1_MAR"), size = size) 
+
+# Combine plots into a single figure with overlapped layers
+combined_plot <- plot_mu1_MAR +
+  
+  geom_ribbon(data = data_mu2_MAR, aes(x = perc, ymin = lower_mu2_MAR, ymax = upper_mu2_MAR, fill = "mu2_MAR"), alpha = 0.1) +
+  geom_line(data = data_mu2_MAR, aes(x = perc, y = mu2_err_MAR.K, color = "mu2_MAR"), size = size) +
+  
+  geom_ribbon(data = data_mu3_MAR, aes(x = perc, ymin = lower_mu3_MAR, ymax = upper_mu3_MAR, fill = "mu3_MAR"), alpha = 0.1) +
+  geom_line(data = data_mu3_MAR, aes(x = perc, y = mu3_err_MAR.K, color = "mu3_MAR"), size = size) +
+  
+    geom_ribbon(data = data_mu4_MAR, aes(x = perc, ymin = lower_mu4_MAR, ymax = upper_mu4_MAR, fill = "mu4_MAR"), alpha = 0.1) +
+  geom_line(data = data_mu4_MAR, aes(x = perc, y = mu4_err_MAR.K, color = "mu4_MAR"), size = size) +
+  
+    geom_ribbon(data = data_mu1_MCAR, aes(x = perc, ymin = lower_mu1_MCAR, ymax = upper_mu1_MCAR, fill = "mu1_MCAR"), alpha = 0.1) +
+  geom_line(data = data_mu1_MCAR, aes(x = perc, y = mu1_err_MCAR.K, color = "mu1_MCAR"), size = size) +
+
+  labs(title = expression(bold("RMSE of Each Coordinate of " * mu[EM] * " vs. Proportion of Missing Data")), x = "Proportion of Missing Data", y = "RMSE") +
+  scale_color_manual(values = c("blue", "red", "green", "darkorange", "purple"), breaks = c("mu1_MCAR", "mu1_MAR", "mu2_MAR", "mu3_MAR", "mu4_MAR"), labels=c( "mu1_MCAR", "mu1_MAR", "mu2_MAR", "mu3_MAR", "mu4_MAR")) +
+  scale_fill_manual(values = c( "blue", "red", "green", "darkorange", "purple"), breaks = c("mu1_MCAR", "mu1_MAR", "mu2_MAR", "mu3_MAR", "mu4_MAR"), labels=c("mu1_MCAR", "mu1_MAR", "mu2_MAR", "mu3_MAR", "mu4_MAR")) +
+  theme_minimal() +
+  scale_x_continuous(breaks = c(0.05, 0.25, 0.50, 0.70)) +
+  labs(color = "RMSE", fill = "Confidence Interval")
+
+# Print the combined plot
+print(combined_plot)
+```
+
+From @fig-comparisonone, we can see that the performance of the EM algorithm in this setting heavily depends on the correlation between the variables used to generate MAR data, especially for percentages of missing data higher than 20%. The pattern is quite clear: the higher the correlation between the variables when generating MAR data, the higher the error. The difference is more and more evident as the percentage of missing data increases. On the other hand, when we have a column with MAR data, that is, however, uncorrelated with all the others, the estimation of its mean through the EM algorithm is equivalent to that of the same method applied to MCAR data. From these observations, we can deduce that when performing mean estimation with the EM algorithm, one should think very carefully about the correlations between variables, especially when faced with MAR data.
+
+## EM for Linear Regression {#sec-linearone}
+
+Let us now consider the following linear regression framework: $$Y = \hat{X} \beta + \epsilon,$$
+
+$\hat{X} = (1, X)$ and observations drawn from a multivariate normal distribution with $\mu = (-2,-1,0,1)^T$ and $\Sigma = \begin{bmatrix} 1 & 0.4 & 0.5 & 0.2 \\ 0.4 & 2 & 0.6 & 0.4 \\ 0.5 & 0.6 & 3 & 0.9 \\ 0.2 & 0.4 & 0.9 & 4 \\ \end{bmatrix}$ , the noise is $\epsilon \sim \mathcal{N}(0,1)$, and $\beta = (2,3,-1,4,3)$. Then, we introduce missing data in the design matrix X and use the EM algorithm to find estimates $\beta_{EM}$, measuring their accuracy with the RMSE. This investigation offers valuable insights into the algorithm's effectiveness in handling missing data within the context of linear regression modeling.
+
+```{r}
+#| output: false
+#| warning: false
+
+set.seed(1)
+K <- 100
+mu_X <- c(-2, 1, 0, 1)
+Sigma_X <- matrix(c(1, 0.4, 0.5, 0.2, 
+                    0.4, 2, 0.6, 0.4, 
+                    0.5, 0.6, 3, 0.9, 
+                    0.2, 0.4, 0.9, 4), nrow = 4, ncol = 4)
+beta <- c(2, 3, -1, 4, 3)
+sigma_eps <- 1
+err_MCAR <- numeric(P)
+err_MCAR_matrix <- matrix(0, nrow = K, ncol = P)
+perc <- numeric(P)
+
+for (j in 1:K) {
+  # Complete data
+  X_complete <- mvrnorm(n, mu_X, Sigma_X)
+  y_complete <- cbind(rep(1, n), X_complete) %*% beta + rnorm(n, 0, sigma_eps)
+  
+  for (i in 0:P) {
+    # Add missing values
+    data_miss <- generate_data(X_complete, 0.05*i, "MCAR")
+    perc[i] <- 0.05*i
+    
+    X <- as.matrix(data_miss) 
+    s <- prelim.norm(cbind(y_complete, X))
+    thetahat <- em.norm(s, showits = FALSE)
+    pars <- getparam.norm(s, thetahat)
+    
+    # Estimation of regression parameters
+    b.est <- c(pars$mu[1] - pars$sigma[1,2:5] %*% solve(pars$sigma[2:5,2:5]) %*% pars$mu[2:5], 
+               pars$sigma[1,2:5] %*% solve(pars$sigma[2:5,2:5]))
+    
+    err_MCAR_matrix[j,i] <- sqrt(mean((beta - b.est)^2))
+    err_MCAR[i] <- err_MCAR[i] + sqrt(mean((beta - b.est)^2))
+  }
+}
+
+err_MCAR <- err_MCAR / K
+
+lower_MCAR <- c()
+upper_MCAR <- c()
+
+# Apply the function to each column of the matrix
+confidence_intervals <- apply(err_MCAR_matrix, 2, calculate_confidence_interval)
+
+for (i in 1:P){
+  lower_MCAR <- c(lower_MCAR, confidence_intervals[1,i])
+  upper_MCAR <- c(upper_MCAR, confidence_intervals[2,i])
+}
+```
+
+```{r}
+#| output: false
+#| warning: false
+err_MAR <- numeric(P)
+err_MAR_matrix <- matrix(0, nrow = K, ncol = P)
+
+for (j in 1:K) {
+  # Complete data
+  X_complete <- mvrnorm(n, mu_X, Sigma_X)
+  
+  y_complete <- cbind(rep(1, n), X_complete) %*% beta + rnorm(n, 0, sigma_eps)
+  df <- as.data.frame(X_complete)
+  data_miss <- data.frame(matrix(nrow = n, ncol = 4))
+  
+  for (i in 1:P) {
+    # Add missing values
+    data_miss[, 1] <- delete_MAR_censoring(df, 0.05*i, "V1", cols_ctrl = "V2")[, 1]
+    data_miss[, 2] <- delete_MAR_censoring(df, 0.05*i, "V2", cols_ctrl = "V3")[, 2]
+    data_miss[, 3] <- delete_MAR_censoring(df, 0.05*i, "V3", cols_ctrl = "V4")[, 3]
+    data_miss[, 4] <- delete_MAR_censoring(df, 0.05*i, "V4", cols_ctrl = "V2")[, 4]
+    
+    X <- as.matrix(data_miss) 
+    s <- prelim.norm(cbind(y_complete, X))
+    thetahat <- em.norm(s, showits = FALSE)
+    pars <- getparam.norm(s, thetahat)
+    
+    # Estimation of regression parameters
+    b.est <- c(pars$mu[1] - pars$sigma[1,2:5] %*% solve(pars$sigma[2:5,2:5]) %*% pars$mu[2:5], 
+               pars$sigma[1,2:5] %*% solve(pars$sigma[2:5,2:5]))
+  
+    err_MAR_matrix[j,i] <- sqrt(mean((beta - b.est)^2))
+    err_MAR[i] <- err_MAR[i] + sqrt(mean((beta - b.est)^2))
+  }
+}
+
+err_MAR <- err_MAR / K
+
+lower_MAR <- c()
+upper_MAR <- c()
+
+# Apply the function to each column of the matrix
+confidence_intervals <- apply(err_MAR_matrix, 2, calculate_confidence_interval)
+
+for (i in 1:P){
+  lower_MAR <- c(lower_MAR, confidence_intervals[1,i])
+  upper_MAR <- c(upper_MAR, confidence_intervals[2,i])
+}
+```
+
+```{r}
+#| output: false
+#| warning: false
+err_MNAR <- numeric(P)
+err_MNAR_matrix <- matrix(0, nrow = K, ncol = P)
+
+for (j in 1:K) {
+  # Complete data
+  X_complete <- mvrnorm(n, mu_X, Sigma_X)
+  colnames(X_complete) <- c("X1", "X2", "X3", "X4")
+  
+  y_complete <- cbind(rep(1, n), X_complete) %*% beta + rnorm(n, 0, sigma_eps)
+  
+  for (i in 1:P) {
+    # Add missing values
+    data_miss <- produce_NA(X_complete, mechanism="MNAR", self.mask="lower", idx.incomplete = c(1,1,1,1), perc.missing=0.05*i)
+    X <-as.matrix(as.data.frame(data_miss$data.incomp))
+    perc[i] <- 0.05*i
+  
+    s <- prelim.norm(cbind(y_complete, X))
+    thetahat <- em.norm(s, showits = FALSE)
+    pars <- getparam.norm(s, thetahat)
+    
+    # Estimation of regression parameters
+    b.est <- c(pars$mu[1] - pars$sigma[1,2:5] %*% solve(pars$sigma[2:5,2:5]) %*% pars$mu[2:5], 
+               pars$sigma[1,2:5] %*% solve(pars$sigma[2:5,2:5]))
+    
+    err_MNAR_matrix[j,i] <- sqrt(mean((beta - b.est)^2))
+    err_MNAR[i] <- err_MNAR[i] + sqrt(mean((beta - b.est)^2))
+  }
+}
+
+err_MNAR <- err_MNAR / K
+
+lower_MNAR <- c()
+upper_MNAR <- c()
+
+# Apply the function to each column of the matrix
+confidence_intervals <- apply(err_MNAR_matrix, 2, calculate_confidence_interval)
+
+for (i in 1:P){
+  lower_MNAR <- c(lower_MNAR, confidence_intervals[1,i])
+  upper_MNAR <- c(upper_MNAR, confidence_intervals[2,i])
+}
+```
+
+The plot below displays the RMSE of linear regression estimates $\beta_{EM}$ across various levels of missing data for the three mechanisms.
+
+```{r, fig.width= 7, fig.height=5, out.width="80%"}
+#| label: fig-comparisontwo
+#| fig-cap: RMSE of $\beta_{EM}$ for the three different mechanisms as the percentage of missing data grows, with 95% confidence intervals for linear regression.
+# Combine data into a data frame
+data_MCAR <- data.frame(perc, err_MCAR, lower_MCAR, upper_MCAR)
+data_MAR <- data.frame(perc, err_MAR, lower_MAR, upper_MAR)
+data_MNAR <- data.frame(perc, err_MNAR, lower_MNAR, upper_MNAR)
+size <- 0.8
+
+# Create ggplot objects
+plot_MCAR <- ggplot(data_MCAR, aes(x = perc, y = err_MCAR)) +
+  geom_line(aes(color = "MCAR"), size = size) +
+  geom_ribbon(aes(ymin = lower_MCAR, ymax = upper_MCAR, fill = "MCAR"), alpha = 0.1)
+
+plot_MAR <- ggplot(data_MAR, aes(x = perc, y = err_MAR)) +
+  geom_ribbon(aes(ymin = lower_MAR, ymax = upper_MAR, fill = "MAR"), alpha = 0.1) +
+  geom_line(aes(color = "MAR"))
+
+plot_MNAR <- ggplot(data_MNAR, aes(x = perc, y = err_MNAR)) +
+  geom_ribbon(aes(ymin = lower_MNAR, ymax = upper_MNAR, fill = "MNAR"), alpha = 0.1) +
+  geom_line(aes(color = "MNAR"))
+
+# Combine plots into a single figure with overlapped layers
+combined_plot <- plot_MCAR +
+  geom_ribbon(data = data_MAR, aes(x = perc, ymin = lower_MAR, ymax = upper_MAR, fill = "MAR"), alpha = 0.1) +
+  geom_line(data = data_MAR, aes(x = perc, y = err_MAR, color = "MAR"), size = size) +
+  geom_ribbon(data = data_MNAR, aes(x = perc, ymin = lower_MNAR, ymax = upper_MNAR, fill = "MNAR"), alpha = 0.1) +
+  geom_line(data = data_MNAR, aes(x = perc, y = err_MNAR, color = "MNAR"), size = size) +
+  labs(title = expression(bold("RMSE of " * beta[EM] *" vs. Proportion of Missing Data")), x = "Proportion of Missing Data", y = "RMSE") +
+  scale_color_manual(values = c("blue", "red", "green"), breaks = c("MCAR", "MAR", "MNAR")) +
+  scale_fill_manual(values = c("blue", "red", "green"), breaks = c("MCAR", "MAR", "MNAR")) +
+  theme_minimal() +
+  scale_x_continuous(breaks = c(0.05, 0.25, 0.5, 0.70)) +
+  labs(color = "RMSE", fill = "Confidence Interval")
+
+# Print the combined plot
+print(combined_plot)
+```
+
+@fig-comparisontwo clearly delineates two distinct error trends for different missing data mechanisms. The first trend concerns the RMSE for both MCAR and MAR mechanisms, which follow a similar pattern over the range of missing data proportions. Moreover, the error associated with MCAR consistently remains only marginally lower (unlike for mean and covariance estimation) than that for MAR. The errors associated with the MNAR mechanism follow a different trend, escalating more sharply, especially after the 25% missing data threshold. This marked hike suggests EM's greater sensitivity to the proportion of missing data in the MNAR case when compared to MCAR and MAR.
+
+### A More in Depth Look at how $\Sigma$ Affects EM Performance in Linear Regression with MAR Data
+
+We now generate multivariate random data with $\mu = (0,0,0,0)^T$ and $\Sigma = \begin{bmatrix} 1 & 0 & 0 & 0 \\ 0 & 1 & 0.5 & 0.7 \\ 0 & 0.5 & 1 & 0.9 \\ 0 & 0.7 & 0.9 & 1 \\ \end{bmatrix}.$ Note that the first variable is independent of all the others. Then, we generate MAR data in column $1$ conditioned on column $2$ (covariance $0$), on column $2$ conditioned on column $3$ (covariance $0.5$), on column $3$ conditioned on column $4$ (covariance $0.7$) and on column $4$ conditioned on column $2$ (covariance $0.9$). We are interested to see how the error of each coordinate of $\beta_{EM}$ will behave, in particular when compared to the more preferable setting of MCAR data. Will we see the same phenomenon as in @sec-depthone, or will the more complex (when compared to mean estimation) nature of linear regression reveal different patterns?
+
+```{r}
+set.seed(1)
+K <- 600
+P <- 12
+
+beta1_err_MAR <- numeric(P)
+beta1_err_MAR_matrix <- matrix(0, nrow = K, ncol = P)
+
+beta2_err_MAR <- numeric(P)
+beta2_err_MAR_matrix <- matrix(0, nrow = K, ncol = P)
+
+beta3_err_MAR <- numeric(P)
+beta3_err_MAR_matrix <- matrix(0, nrow = K, ncol = P)
+
+beta4_err_MAR <- numeric(P)
+beta4_err_MAR_matrix <- matrix(0, nrow = K, ncol = P)
+
+beta1_err_MCAR <- numeric(P)
+beta1_err_MCAR_matrix <- matrix(0, nrow = K, ncol = P)
+
+beta2_err_MCAR <- numeric(P)
+
+perc <- numeric(P)
+  
+mu <- c(0, 0, 0, 0)
+sigma <- matrix(c(1, 0, 0, 0,
+                  0, 1, 0.5, 0.7,
+                  0, 0.5, 1, 0.9, 
+                  0, 0.7, 0.9, 1), ncol = 4)
+beta <- c(1, 1, 1, 1, 1)
+sigma_eps <- 1
+
+for (j in 1:K) {
+  multivariate_data <- mvrnorm(n = n, mu = mu, Sigma = sigma)
+    df <- as.data.frame(multivariate_data)
+    df_mar <- data.frame(matrix(nrow = n, ncol = 4))
+    y_complete_MAR <- cbind(rep(1, n), multivariate_data) %*% beta + rnorm(n, 0, sigma_eps)
+    y_complete_MCAR <- cbind(rep(1, n), multivariate_data) %*% beta + rnorm(n, 0, sigma_eps)
+  
+  for (i in 0:P) {
+    p <- 0.05 * i
+    perc[i] <- p
+    df_mar[, 1] <- delete_MAR_censoring(df, p = p, "V1", cols_ctrl = "V2")[, 1]
+    df_mar[, 2] <- delete_MAR_censoring(df, p = p, "V2", cols_ctrl = "V3")[, 2]
+    df_mar[, 3] <- delete_MAR_censoring(df, p = p, "V3", cols_ctrl = "V4")[, 3]
+    df_mar[, 4] <- delete_MAR_censoring(df, p = p, "V4", cols_ctrl = "V2")[, 4]
+    df_mcar <- delete_MCAR(df, p = p, c("V1", "V2", "V3", "V4"))
+    
+    s_mar <- prelim.norm(cbind(y_complete_MAR, df_mar$X1, df_mar$X2, df_mar$X3, df_mar$X4))
+    s_mcar <- prelim.norm(cbind(y_complete_MCAR, df_mcar$V1, df_mcar$V2, df_mcar$V3, df_mcar$V4))
+    invisible(capture.output(thetahat_mar <- em.norm(s_mar, showits = FALSE)))
+    invisible(capture.output(thetahat_mcar <- em.norm(s_mcar, showits = FALSE)))
+
+    pars_mar <- getparam.norm(s_mar, thetahat_mar)
+    pars_mcar <- getparam.norm(s_mcar, thetahat_mcar)
+    
+    b_est_MAR <- c(pars_mar$mu[1] - pars_mar$sigma[1,2:5] %*% solve(pars_mar$sigma[2:5,2:5]) %*% pars_mar$mu[2:5], pars_mar$sigma[1,2:5] %*% solve(pars_mar$sigma[2:5,2:5]))
+    
+    b_est_MCAR <- c(pars_mcar$mu[1] - pars_mcar$sigma[1,2:5] %*% solve(pars_mcar$sigma[2:5,2:5]) %*% pars_mcar$mu[2:5], pars_mcar$sigma[1,2:5] %*% solve(pars_mcar$sigma[2:5,2:5]))
+    
+    perc[i] <- p
+    
+    beta1_err_MAR[i] <- beta1_err_MAR[i] + sqrt(mean((beta[2] - b_est_MAR[2])^2))
+    beta1_err_MAR_matrix[j,i] <- sqrt(mean((beta[2] - b_est_MAR[2])^2))
+    
+    beta2_err_MAR[i] <- beta2_err_MAR[i] + sqrt(mean((beta[3] - b_est_MAR[3])^2))
+    beta2_err_MAR_matrix[j,i] <- sqrt(mean((beta[3] - b_est_MAR[3])^2))
+    
+    beta3_err_MAR[i] <- beta3_err_MAR[i] + sqrt(mean((beta[4] - b_est_MAR[4])^2))
+    beta3_err_MAR_matrix[j,i] <- sqrt(mean((beta[4] - b_est_MAR[4])^2))
+      
+    beta4_err_MAR[i] <- beta4_err_MAR[i] + sqrt(mean((beta[5] - b_est_MAR[5])^2))
+    beta4_err_MAR_matrix[j,i] <- sqrt(mean((beta[5] - b_est_MAR[5])^2))
+          
+    beta1_err_MCAR[i] <- beta1_err_MCAR[i] + sqrt(mean((beta[2] - b_est_MCAR[2])^2))
+    beta1_err_MCAR_matrix[j,i] <- sqrt(mean((beta[2] - b_est_MCAR[2])^2))
+    
+     beta2_err_MCAR[i] <- beta2_err_MCAR[i] + sqrt(mean((beta[3] - b_est_MCAR[3])^2))
+
+  }
+}
+
+lower_beta1_MAR <- c()
+upper_beta1_MAR <- c()
+
+lower_beta2_MAR <- c()
+upper_beta2_MAR <- c()
+
+lower_beta3_MAR <- c()
+upper_beta3_MAR <- c()
+
+lower_beta4_MAR <- c()
+upper_beta4_MAR <- c()
+
+lower_beta1_MCAR <- c()
+upper_beta1_MCAR <- c()
+
+# Apply the function to each column of the matrix
+confidence_intervals_beta_1_MAR <- apply(beta1_err_MAR_matrix, 2, calculate_confidence_interval)
+
+confidence_intervals_beta_2_MAR <- apply(beta2_err_MAR_matrix, 2, calculate_confidence_interval)
+
+confidence_intervals_beta_3_MAR <- apply(beta3_err_MAR_matrix, 2, calculate_confidence_interval)
+
+confidence_intervals_beta_4_MAR <- apply(beta4_err_MAR_matrix, 2, calculate_confidence_interval)
+
+confidence_intervals_beta_1_MCAR <- apply(beta1_err_MCAR_matrix, 2, calculate_confidence_interval)
+
+for (i in 1:P){
+  lower_beta1_MAR <- c(lower_beta1_MAR, confidence_intervals_beta_1_MAR[1,i])
+  upper_beta1_MAR <- c(upper_beta1_MAR, confidence_intervals_beta_1_MAR[2,i])
+  
+  lower_beta2_MAR <- c(lower_beta2_MAR, confidence_intervals_beta_2_MAR[1,i])
+  upper_beta2_MAR <- c(upper_beta2_MAR, confidence_intervals_beta_2_MAR[2,i])
+  
+  lower_beta3_MAR <- c(lower_beta3_MAR, confidence_intervals_beta_3_MAR[1,i])
+  upper_beta3_MAR <- c(upper_beta3_MAR, confidence_intervals_beta_3_MAR[2,i])
+  
+  lower_beta4_MAR <- c(lower_beta4_MAR, confidence_intervals_beta_4_MAR[1,i])
+  upper_beta4_MAR <- c(upper_beta4_MAR, confidence_intervals_beta_4_MAR[2,i])
+  
+  lower_beta1_MCAR <- c(lower_beta1_MCAR, confidence_intervals_beta_1_MCAR[1,i])
+  upper_beta1_MCAR <- c(upper_beta1_MCAR, confidence_intervals_beta_1_MCAR[2,i])
+}
+```
+
+```{r, fig.width= 7, fig.height=5, out.width="80%"}
+#| label: fig-comparisonthree
+#| fig-cap: RMSE of $\beta_i, \ i = 1,\dots,4$ for MAR data and of $\beta_1$ for MCAR data in the setting of linear regression, with 95% confidence intervals.
+# Create ggplot objects
+data_beta1_MAR <- data.frame(perc, beta1_err_MAR/K, lower_beta1_MAR, upper_beta1_MAR)
+data_beta2_MAR <- data.frame(perc, beta2_err_MAR/K, lower_beta2_MAR, upper_beta2_MAR)
+data_beta3_MAR <- data.frame(perc, beta3_err_MAR/K, lower_beta3_MAR, upper_beta3_MAR)
+data_beta4_MAR <- data.frame(perc, beta4_err_MAR/K, lower_beta4_MAR, upper_beta4_MAR)
+
+data_beta1_MCAR <- data.frame(perc, beta1_err_MCAR/K, lower_beta1_MCAR, upper_beta1_MCAR)
+
+size <- 0.8
+
+plot_beta1_MAR <- ggplot(data_beta1_MAR, aes(x = perc, y = beta1_err_MAR/K)) +
+  geom_ribbon(aes(ymin = lower_beta1_MAR, ymax = upper_beta1_MAR, fill = "beta1_MAR"), alpha = 0.1) +
+  geom_line(aes(color = "beta1_MAR"), size = size) 
+
+# Combine plots into a single figure with overlapped layers
+combined_plot <- plot_beta1_MAR +
+  
+  geom_ribbon(data = data_beta2_MAR, aes(x = perc, ymin = lower_beta2_MAR, ymax = upper_beta2_MAR, fill = "beta2_MAR"), alpha = 0.1) +
+  geom_line(data = data_beta2_MAR, aes(x = perc, y = beta2_err_MAR.K, color = "beta2_MAR"), size = size) +
+  
+  geom_ribbon(data = data_beta3_MAR, aes(x = perc, ymin = lower_beta3_MAR, ymax = upper_beta3_MAR, fill = "beta3_MAR"), alpha = 0.1) +
+  geom_line(data = data_beta3_MAR, aes(x = perc, y = beta3_err_MAR.K, color = "beta3_MAR"), size = size) +
+  
+  geom_ribbon(data = data_beta4_MAR, aes(x = perc, ymin = lower_beta4_MAR, ymax = upper_beta4_MAR, fill = "beta4_MAR"), alpha = 0.1) +
+  geom_line(data = data_beta4_MAR, aes(x = perc, y = beta4_err_MAR.K, color = "beta4_MAR"), size = size) +
+  
+  geom_ribbon(data = data_beta1_MCAR, aes(x = perc, ymin = lower_beta1_MCAR, ymax = upper_beta1_MCAR, fill = "beta1_MCAR"), alpha = 0.1) +
+  geom_line(data = data_beta1_MCAR, aes(x = perc, y = beta1_err_MCAR.K, color = "beta1_MCAR"), size = size) +
+
+  labs(title = expression(bold("RMSE of each coordinate of " * beta[EM] * " vs. Proportion of Missing Data")), x = "Proportion of Missing Data", y = "RMSE") +
+  scale_color_manual(values = c("blue", "red", "green", "darkorange", "purple"), breaks = c( "beta1_MCAR", "beta1_MAR", "beta2_MAR", "beta3_MAR", "beta4_MAR"), labels=c("beta1_MCAR", "beta1_MAR", "beta2_MAR", "beta3_MAR", "beta4_MAR")) +
+  scale_fill_manual(values = c("blue", "red", "green", "darkorange", "purple"), breaks = c("beta1_MCAR", "beta1_MAR", "beta2_MAR", "beta3_MAR", "beta4_MAR"), labels=c("beta1_MCAR", "beta1_MAR", "beta2_MAR", "beta3_MAR", "beta4_MAR")) +
+  theme_minimal() +
+  labs(color = "RMSE", fill = "Confidence Interval")+
+  scale_x_continuous(breaks = c(0.05, 0.2, 0.4, 0.6))
+
+# Print the combined plot
+print(combined_plot)
+```
+
+@fig-comparisonthree reveals a different behavior than that found in @sec-depthone. While the error for $\beta_1$ evolves similarly for the MAR (uncorrelated column) and MCAR scenarios, the other errors are not in order of correlation between the target and control columns when producing NA's (if they were, the errors associated with $\beta_2$ and $\beta_3$ would be switched). Rather, the errors, already from low percentages of missing data, are ordered by the sum of the covariances of the target column with the other variables. To clarify, columns $1-4$ are ordered by the sum of the covariances with the other variables and this causes the errors associated with $\beta_1,\dots,\beta_4$ to be ordered in the same way. This experiment, again, suggests that when using EM on MAR data it is crucial to carefully think about the correlations between the variables, as these heavily affect the performance of the algorithm.
+
+Note: for this last experiment, we introduced up to $60\%$ of missing data for visualization purposes, since the results for higher percentages were characterized by high variance.
+
+## EM for Logistic Regression {#sec-logone}
+
+We now dive deep into another application of the EM algorithm in the context of missing data: logistic regression.
+
+Let $(y_i, X_i)$ be $n$ i.i.d. observation with $y_i \in \{0, \ 1\}$ binary response. As in the context of linear regression, we generate our data $X$ from a multivariate normal distribution. If we also define the unknown parameters $\beta = (\beta_0, ..., \beta_p)^T$ , for notation purposes, we can group the various quantities of the model as follows $\theta := (\mu, \Sigma, \beta)$.
+
+Recall that the logistic regression model for binary classification can be written as: $$ \mathbb{P}(y_i = 1 | X_i,\beta) = \frac{exp\left(\beta_0 + \sum_{j=1}^p \beta_jX_{ij}\right)}{1 + exp\left(\beta_0 + \sum_{j=1}^p \beta_jX_{ij}\right)}, \ i=1,...,n. $$
+
+Analogously to the linear regression framework, our goal is to use the EM algorithm to estimate $\beta$ when there are missing values in the design matrix $X$.
+
+Unlike in the case of linear regression, for logistic regression there is not a closed-form expression for the expectation in the E-step of the EM algorithm. Therefore, we are going to use a Monte Carlo version of EM, first proposed in [@MCforEM]: to calculate the above-mentioned expectation, a large number of samples of missing data from $p(X_{MIS}|X_{OBS},y; \theta)$ are generated and the expectation is then replaced by the empirical mean. An accurate estimation of this expectation requires a significant computational effort. Thus, to reduce such complexity, a Stochastic Approximation EM (SAEM) [@lavielle2014] is often used instead.
+
+SAEM replaces the E-step by a stochastic approximation based on a single simulation of $X_{MIS}$ and the $t^{th}$ iteration consists of the following three steps (starting point $\theta^{(0)}$):
+
+-   For $i=1,…,n$ draw uniformly at random a single sample $X_{MIS}^{(t)}$ from the conditional distribution of missing variables $p(X_{MIS}|X_{OBS}, y;\theta^{(t-1)})$.
+
+-   Update the function $Q$: $Q(\theta, \theta^{(t)}) = Q(\theta, \theta^{(t-1)}) + \gamma_t \left(\mathcal{l}(\theta; X_{OBS},X_{MIS}^{(t)},y) - Q(\theta, \theta^{(t-1)})\right).$
+
+    Where $l(\theta; X, y)$ is the log-likelihood for the complete data.
+
+-   Maximization step: update the estimation of $\theta$.
+
+    $$\theta^{(t+1)} = argmax_\theta Q(\theta, \theta^{(t)}).$$
+
+This methodology is implemented in the $\texttt{R}$ package $\texttt{misaem}$. In the paragraphs below, we are going to illustrate some examples and report experimental results produced by the application of the algorithm for logistic regression.
+
+As suggested in [@MCEM], we generate a design matrix $X\in \mathbb{R}^{n\times p}$ with $n=300$ (observations) and $p=2$ (covariates) drawing each observation as we mentioned before from a multivariate normal distribution $\mathcal{N}_p(\mu,\Sigma)$ with: $$\mu = (1,2)^T, \\ \Sigma = diag(\sigma)Cdiag(\sigma), $$
+
+where $\sigma = (1,2)^T$ and the correlation matrix $C$ is: $$
+C = \begin{bmatrix}1 & 0.8\\0.8 & 1\end{bmatrix}.
+$$
+
+For the logistic model, we use $\beta = (0,1,-1)$. Below, we compute $\beta_{EM}$ for the three different mechanisms and percentages of missing data ranging from $5$ to $70\%$, compute the RMSE for each estimate, and plot the results. Note that this method is quite expensive in terms of computing resources. Thus, to avoid running the code for an excessive amount of time, we had to limit ourselves to averaging over only 10 experiments: this caused the error to be a bit volatile. Still, we can advance some statements about the performances of EM in this scenario by analyzing the plots below. For brevity, throughout the rest of the project, in the contest of logistic regression we will refer to the SAEM algorithm just by EM.
+
+```{r}
+#| warning: false
+
+# Generate dataset
+N <- 300
+p <- 2     # number of explanatory variables
+mu.star <- 1:p  # mean of the explanatory variables
+sd <- 1:p  # standard deviations
+C <- matrix(c(   # correlation matrix
+  1,   0.8,
+  0.8, 1), nrow=p)
+Sigma.star <- diag(sd)%*%C%*%diag(sd) # covariance matrix
+beta.star <- c(1, -1) # coefficients
+beta0.star <- 0  # intercept
+beta.true = c(beta0.star, beta.star)
+
+# Design matrix
+X.complete <- matrix(rnorm(N*2), nrow=N)%*%chol(Sigma.star)+
+  matrix(rep(mu.star,N), nrow=N, byrow = TRUE)
+
+# Response vector
+p1 <- 1/(1+exp(-X.complete%*%beta.star-beta0.star))
+y <- as.numeric(runif(N)<p1)
+```
+
+```{r}
+# -------------- MCAR -----------------
+K <- 10
+P <- 14
+  
+perc <- numeric(P)
+params_errors_MCAR <- numeric(P)
+  
+params_errors_MCAR_matrix <-  matrix(0, nrow = K, ncol = P)
+  
+for (j in 1:K){
+    X.complete <- matrix(rnorm(N*2), nrow=N)%*%chol(Sigma.star)+
+  matrix(rep(mu.star,N), nrow=N, byrow = TRUE)
+    # Response vector
+    p1 <- 1/(1+exp(-X.complete%*%beta.star-beta0.star))
+    y <- as.numeric(runif(N)<p1)
+    
+    for (i in 0:P){
+      perc[i] <- 0.05*i
+      X.obs <- generate_data_2col(X.complete, 0.05*i, "MCAR")
+      
+      # SAEM
+      df.obs = data.frame(y, X.obs)
+      miss.list = miss.glm(y~as.matrix(X.obs), print_iter = FALSE, seed=100)
+      
+      # estimation of parameters
+      params_errors_MCAR[i] <- params_errors_MCAR[i] + sqrt(mean((miss.list$coefficients-beta.true)^2))
+      params_errors_MCAR_matrix[j,i] <- sqrt(mean((miss.list$coefficients-beta.true)^2))
+    }
+  }
+  
+lower_MCAR <- c()
+upper_MCAR <- c()
+
+# Apply the function to each column of the matrix
+confidence_intervals <- apply(params_errors_MCAR_matrix, 2, calculate_confidence_interval)
+
+for (i in 0:P){
+  lower_MCAR <- c(lower_MCAR, confidence_intervals[1,i])
+  upper_MCAR <- c(upper_MCAR, confidence_intervals[2,i])
+}
+```
+
+```{r}
+# -------------- MAR -----------------
+params_errors_MAR <- numeric(P)
+params_errors_MAR_matrix <-  matrix(0, nrow = K, ncol = P)
+
+for (j in 1:K){
+  X.complete <- matrix(rnorm(N*p), nrow=N)%*%chol(Sigma.star)+
+  matrix(rep(mu.star,N), nrow=N, byrow = TRUE)
+# Response vector
+  p1 <- 1/(1+exp(-X.complete%*%beta.star-beta0.star))
+  y <- as.numeric(runif(N)<p1)
+  df <- as.data.frame(X.complete)
+
+  for (i in 0:P){
+    X.obs[,1] <- delete_MAR_censoring(df, 0.05*i, "V1", "V2")[,1]
+    X.obs[,2] <- delete_MAR_censoring(df, 0.05*i, "V2", "V1")[,2]
+  
+  # SAEM
+    df.obs = data.frame(y, X.obs)
+    miss.list = miss.glm(y~as.matrix(X.obs), print_iter = FALSE, seed=100)
+  
+  # estimation of parameters
+    params_errors_MAR[i] <- params_errors_MAR[i] + sqrt(mean((miss.list$coefficients-beta.true)^2))
+    params_errors_MAR_matrix[j,i] <- sqrt(mean((miss.list$coefficients-beta.true)^2))
+  }
+}
+
+lower_MAR <- c()
+upper_MAR <- c()
+
+# Apply the function to each column of the matrix
+confidence_intervals <- apply(params_errors_MAR_matrix, 2, calculate_confidence_interval)
+
+for (i in 0:P){
+  lower_MAR <- c(lower_MAR, confidence_intervals[1,i])
+  upper_MAR <- c(upper_MAR, confidence_intervals[2,i])
+}
+```
+
+```{r}
+# -------------- MNAR -----------------
+params_errors_MNAR <- numeric(P)
+params_errors_MNAR_matrix <- matrix(0, nrow = K, ncol = P)
+
+for (j in 1:K){
+  X.complete <- matrix(rnorm(N*p), nrow=N)%*%chol(Sigma.star)+
+    matrix(rep(mu.star,N), nrow=N, byrow = TRUE)
+  # Response vector
+  p1 <- 1/(1+exp(-X.complete%*%beta.star-beta0.star))
+  y <- as.numeric(runif(N)<p1)
+  
+  for (i in 0:P){
+    X.obs <- generate_data_2col(X.complete, 0.05*i, "MNAR")
+    
+    # SAEM
+    df.obs = data.frame(y, X.obs)
+    miss.list = miss.glm(y~as.matrix(X.obs), print_iter = FALSE, seed=100)
+    
+    # estimation of parameters
+    params_errors_MNAR[i] <- params_errors_MNAR[i] + sqrt(mean((miss.list$coefficients-beta.true)^2))
+    params_errors_MNAR_matrix[j,i] <- sqrt(mean((miss.list$coefficients-beta.true)^2))
+  }
+}
+
+lower_MNAR <- c()
+upper_MNAR <- c()
+
+# Apply the function to each column of the matrix
+confidence_intervals <- apply(params_errors_MNAR_matrix, 2, calculate_confidence_interval)
+
+for (i in 0:P){
+  lower_MNAR <- c(lower_MNAR, confidence_intervals[1,i])
+  upper_MNAR <- c(upper_MNAR, confidence_intervals[2,i])
+}
+```
+
+```{r, fig.width= 7, fig.height=5, out.width="80%"}
+#| label: fig-comparisonfour
+#| fig-cap: RMSE of $\beta_{EM}$ for the three different mechanisms as the percentage of missing data grows for logistic regression.
+# Combine data into a data frame
+data_MCAR <- data.frame(perc, params_errors_MCAR/K, lower_MCAR, upper_MCAR)
+data_MAR <- data.frame(perc, params_errors_MAR/K, lower_MAR, upper_MAR)
+data_MNAR <- data.frame(perc, params_errors_MNAR/K, lower_MNAR, upper_MNAR)
+size <- 0.8
+
+# Create ggplot objects
+plot_MCAR <- ggplot(data_MCAR, aes(x = perc, y = params_errors_MCAR/K)) +
+  geom_line(aes(color = "MCAR"), size = size)
+
+# Combine plots into a single figure with overlapped layers
+combined_plot <- plot_MCAR +
+  geom_line(data = data_MAR, aes(x = perc, y = params_errors_MAR/K, color = "MAR"), size = size) +
+  geom_line(data = data_MNAR, aes(x = perc, y = params_errors_MNAR/K, color = "MNAR"), size = size) +
+  labs(title = expression(bold("RMSE of " * beta[EM] *" vs. Proportion of Missing Data")), x = "Proportion of Missing Data", y = "RMSE") +
+  scale_color_manual(values = c("MCAR"= "blue", "MAR"=  "red", "MNAR"= "green"), breaks = c("MCAR", "MAR", "MNAR")) +
+  scale_fill_manual(values = c("MCAR"= "blue", "MAR"= "red", "MNAR"=  "green"), breaks = c("MCAR", "MAR", "MNAR")) +
+  theme_minimal() +
+  labs(color = "RMSE", fill = "Confidence Interval")+
+  scale_x_continuous(breaks = c(0.05, 0.25, 0.50, 0.70))
+
+# Print the combined plot
+print(combined_plot)
+```
+
+Similarly to the linear regression setting, @fig-comparisonfour reveals a distinct pattern for MCAR and MAR, and a separate one for MNAR. For MCAR and MAR, we can observe a slight increase on average, of the RMSE of $\beta$ as the percentage of missing data increases. For the MAR mechanism, this increase is slightly more pronounced. Unlike mean and covariance estimation, the MCAR case is not exempt from an error increment for higher percentages. For MNAR, as in the experiments above, the RMSE of $\beta$ increases the quickest as the missing percentage in the data increases. In terms of order of magnitude, from the above figure, it is clear that the setting in which the EM algorithm performs the worst is the MNAR setting. This is also observed in the linear regression problem studied above. Again, as expected, the EM algorithm seems not to be able to get reliable estimates when there are more complex underlying mechanisms under which missing data are generated. 
+
+In conclusion, we can argue that even in this case the EM algorithm is a good choice in the MCAR setting and a decent one even for the MAR setting, specifically when the missing percentage is not very high (\<0.4). On the other hand, we need to be more careful when the missing data are generated not at random. In this case, especially for larger proportions of missing data, the EM algorithm seems to be not a great choice to perform logistic regression.
+
+# Comparison of EM Estimates Against Imputation + Maximum Likelihood Estimation {#sec-section2}
+
+In this section, we compare the results obtained with EM applied to both the linear and logistic regression tasks against those attained by performing data imputation followed by standard maximum likelihood estimation.
+
+## Imputation Methods
+
+We consider four different imputation methods [@Imputation] readily available in the following $\texttt{R}$ packages.
+
+**softImpute:** The $\texttt{softImpute}$ package fits a low-rank matrix approximation to a matrix with missing values via nuclear-norm regularization. $\texttt{softImpute}$ offers two different variants to compute such approximation. One iteratively computes the soft-thresholded SVD of a filled in matrix - an algorithm described in [@maz]. This is option `type="svd"` in the call to `softImpute()`. The other uses alternating ridge regression, at each stage filling in the missing entries with the latest estimates. This we believe is the faster option, and is option `type="als"` in the call to `softImpute()` . We computed the best value of the nuclear-norm regularization parameter $\lambda$ using cross-validation and then we used this $\lambda_{CV}$ when calling `softImpute()` .
+
+**mice:** The mice package implements a multiple imputation methods for multivariate missing data. The mice function computes, based on an incomplete dataset, multiple imputations by chained equations and thus returns *m (*$=5$ in our experiments, the default value*)* imputations, of which we take the mean to generate the final dataset.
+
+**missForest:** The missForest function imputes missing values iteratively by training random forests on the observed values to predict the missing ones.
+
+**missMDA:** The impute PCA function imputes missing values applying principal component methods. The missing values are predicted using the iterative PCA algorithm for a predefined number of dimensions (see [@JSS] for further details).
+
+## Experiments
+
+We now design some experiments to better understand in which settings it is worth using the EM algorithm and in which ones it is instead preferable to opt for data imputation followed by standard maximum likelihood estimation.
+
+### Linear Regression
+
+**MCAR.** First, we perform the experiment for linear regression on datasets generated with the MCAR mechanism. The complete dataset, in this case as well as in the MAR and MNAR cases, was generated exactly as in @sec-linearone.
+
+```{r}
+set.seed(1)
+#|output: false
+#|warning: false
+#|message: false
+# ---------------------- MCAR + LINEAR REGRESSION ------------------------
+n <- 300
+p <- 4
+P <- 14
+K <- 10
+
+err_MCAR_SI <- numeric(P)
+err_MCAR_MMDA <- numeric(P)
+err_MCAR_MF <- numeric(P)
+err_MCAR_MICE <- numeric(P)
+err_MCAR <- numeric(P)
+perc <- numeric(P)
+beta_true <- c(2, 3, -1, 4, 3)
+
+mu.X <- c(-2, 1, 0, 1)
+Sigma.X <- matrix(c(1, 0.4, 0.5, 0.2, 
+                    0.4, 2, 0.6, 0.4, 
+                    0.5, 0.6, 3, 0.9, 
+                    0.2, 0.4, 0.9, 4), nrow = 4, ncol = 4)
+
+for (j in 1:K) {
+  
+  X <- mvrnorm(n,mu.X,Sigma.X) 
+  
+  sigma_eps <- 1
+  y_complete <- cbind(rep(1, n), X) %*% beta_true + rnorm(n, 0, sigma_eps)
+  
+  for (i in 1:P) {
+    XproduceNA <- produce_NA(X,mechanism="MCAR",perc.missing=0.05*i) 
+    XNA<-as.matrix(as.data.frame(XproduceNA$data.incomp))
+    perc[i] <- 0.05*i
+    
+    # EM
+    s <- prelim.norm(cbind(y_complete, XNA))
+    thetahat <- em.norm(s, showits = FALSE)
+    pars <- getparam.norm(s, thetahat)
+    b.est <- c(pars$mu[1] - pars$sigma[1,2:5] %*% solve(pars$sigma[2:5,2:5]) %*% pars$mu[2:5], 
+               pars$sigma[1,2:5] %*% solve(pars$sigma[2:5,2:5]))
+    err_MCAR[i] <- err_MCAR[i] + sqrt(mean((beta_true - b.est)^2))
+    
+    # softimpute
+    lambda_sft<-cv_sft(XNA) 
+    sft<-softImpute(x=XNA,lambda= lambda_sft) 
+    X.sft<-sft$u %*%diag(sft$d)%*%t(sft$v) 
+    X.sft[which(!is.na(XNA))] <- XNA[which(!is.na(XNA))] 
+    mu_hat <- lm(y_complete~X.sft)$coefficients
+    err_MCAR_SI[i] <- err_MCAR_SI[i]+sqrt(mean((mu_hat - beta_true)^2))
+    
+    # mice
+    mice_mice <- mice(data=XNA, m=5, method="pmm", printFlag = FALSE) #contains m=5 completed datasets.
+    IMP<-0 
+    for(h in 1:5){IMP<-IMP + mice::complete(mice_mice,h)} 
+    X.mice <- IMP/5 #5 is the default number of multiple imputations 
+    mu_hat <- lm(y_complete~as.matrix(X.mice))$coefficients
+    err_MCAR_MICE[i] <- err_MCAR_MICE[i]+sqrt(mean((mu_hat - beta_true)^2))
+    
+    # MissForest
+    forest<-missForest(xmis=XNA,maxiter=20,ntree=100)
+    X.forest<-forest$ximp  
+    mu_hat <- lm(y_complete~X.forest)$coefficients
+    err_MCAR_MF[i] <- err_MCAR_MF[i]+sqrt(mean((mu_hat - beta_true)^2))
+    
+    # MissMDA
+    pca<-imputePCA(X=XNA,ncp=2,scale=TRUE,method= c("Regularized","EM"))
+    ncp.pca<-estim_ncpPCA(XNA,method.cv="gcv")$ncp 
+    pca<-imputePCA(XNA,ncp=ncp.pca) 
+    X.pca<-pca$comp 
+    mu_hat <- lm(y_complete~X.pca)$coefficients
+    err_MCAR_MMDA[i] <- err_MCAR_MMDA[i]+sqrt(mean((mu_hat - beta_true)^2))
+  }
+}
+
+err_MCAR_MMDA <- err_MCAR_MMDA/K
+err_MCAR_MF <- err_MCAR_MF/K
+err_MCAR_MICE <- err_MCAR_MICE/K
+err_MCAR_SI <- err_MCAR_SI/K
+err_MCAR <- err_MCAR/K
+```
+
+```{r, fig.width= 7, fig.height=5, out.width="80%"}
+#| label: fig-linMCARimputeone
+#| fig-cap: EM vs imputation + MLE for linear regression on MCAR data.
+set.seed(1)
+# Combine data into a data frame
+data_MCAR <- data.frame(perc, err_MCAR)
+
+data_MCAR_MF <- data.frame(perc, err_MCAR_MF)
+data_MCAR_MMDA <- data.frame(perc, err_MCAR_MMDA)
+data_MCAR_SI <- data.frame(perc, err_MCAR_SI)
+data_MCAR_MICE <- data.frame(perc, err_MCAR_MICE)
+size <- 0.8
+
+# Create ggplot objects
+plot_MCAR <- ggplot(data_MCAR, aes(x = perc, y = err_MCAR)) +
+  geom_line(aes(color = "EM"), size = size) 
+
+# Combine plots into a single figure with overlapped layers
+combined_plot <- plot_MCAR +
+  geom_line(data = data_MCAR_MF, aes(x = perc, y = err_MCAR_MF, color = "MF"), size = size) +
+
+  geom_line(data = data_MCAR_MICE, aes(x = perc, y = err_MCAR_MICE, color = "MICE"), size = size) +
+
+  geom_line(data = data_MCAR_SI, aes(x = perc, y = err_MCAR_SI, color = "SI"), size = size) +
+
+  geom_line(data = data_MCAR_MMDA, aes(x = perc, y = err_MCAR_MMDA, color = "MMDA"), size = size) +
+  
+  labs(title = expression(bold("RMSE obtained with EM vs. imputation + MLE, MCAR mechanism")), x = "Proportion of Missing Data", y = "RMSE") +
+  scale_color_manual(values = c("red", "blue", "green", "black", "orange")) +
+  scale_fill_manual(values = c("red", "blue", "green", "black", "orange")) +
+  theme_minimal() +
+  scale_x_continuous(breaks = c(0.05, 0.25, 0.50, 0.70)) +
+  labs(color = "RMSE", fill = "Confidence Interval")
+
+# Print the combined plot
+print(combined_plot)
+```
+
+From the plot in @fig-linMCARimputeone, we can observe that the method that obtains a lower RMSE for the entire range of the missing percentages is the EM algorithm. We can also notice that this difference is quite marked when increasing the percentage of missing data. Across the imputation methods, the $\texttt{SoftImpute}$method is the one that performs worst; $\texttt{MDA}$*,* $\texttt{MissForest}$, $\texttt{MICE}$ have similar performances, expecially for low percentages of missingness.
+
+**MAR.** Now we perform the experiment for datasets generated with the MAR mechanism.
+
+```{r}
+#|output: false
+#|warning: false
+#|message: false
+# ---------------------- MAR + LINEAR REGRESSION ------------------------
+set.seed(1)
+err_MAR_SI <- numeric(P)
+err_MAR_MMDA <- numeric(P)
+err_MAR_MF <- numeric(P)
+err_MAR_MICE <- numeric(P)
+err_MAR <- numeric(P)
+
+for (j in 1:K) {
+  X <- mvrnorm(n,mu.X,Sigma.X) 
+  
+  y_complete <- cbind(rep(1, n), X) %*% beta_true + rnorm(n, 0, sigma_eps)
+  
+  for (i in 1:P) {
+    XproduceNA <- produce_NA(X,mechanism="MAR",perc.missing=0.05*i) 
+    XNA<-as.matrix(as.data.frame(XproduceNA$data.incomp))
+    perc[i] <- 0.05*i
+    
+    # EM
+    s <- prelim.norm(cbind(y_complete, XNA))
+    thetahat <- em.norm(s, showits = FALSE)
+    pars <- getparam.norm(s, thetahat)
+    b.est <- c(pars$mu[1] - pars$sigma[1,2:5] %*% solve(pars$sigma[2:5,2:5]) %*% pars$mu[2:5], 
+               pars$sigma[1,2:5] %*% solve(pars$sigma[2:5,2:5]))
+    err_MAR[i] <- err_MAR[i] + sqrt(mean((beta_true - b.est)^2))
+    
+    # softimpute
+    lambda_sft<-cv_sft(XNA) 
+    sft<-softImpute(x=XNA,lambda= lambda_sft) 
+    X.sft<-sft$u %*%diag(sft$d)%*%t(sft$v) 
+    X.sft[which(!is.na(XNA))] <- XNA[which(!is.na(XNA))] 
+    mu_hat <- lm(y_complete~X.sft)$coefficients
+    err_MAR_SI[i] <- err_MAR_SI[i]+sqrt(mean((mu_hat - beta_true)^2))
+    
+    # mice
+    mice_mice <- mice(data=XNA, m=5, method="pmm", printFlag = FALSE) #contains m=5 completed datasets.
+    IMP<-0 
+    for(h in 1:5){IMP<-IMP + mice::complete(mice_mice,h)} 
+    X.mice <- IMP/5 #5 is the default number of multiple imputations 
+    mu_hat <- lm(y_complete~as.matrix(X.mice))$coefficients
+    err_MAR_MICE[i] <- err_MAR_MICE[i]+sqrt(mean((mu_hat - beta_true)^2))
+
+    # MissForest
+    forest<-missForest(xmis=XNA,maxiter=20,ntree=100)
+    X.forest<-forest$ximp  
+    mu_hat <- lm(y_complete~X.forest)$coefficients
+    err_MAR_MF[i] <- err_MAR_MF[i]+sqrt(mean((mu_hat - beta_true)^2))
+
+    # MissMDA
+    pca<-imputePCA(X=XNA,ncp=2,scale=TRUE,method= c("Regularized","EM"))
+    ncp.pca<-estim_ncpPCA(XNA,method.cv="gcv")$ncp 
+    pca<-imputePCA(XNA,ncp=ncp.pca) 
+    X.pca<-pca$comp 
+    mu_hat <- lm(y_complete~X.pca)$coefficients
+    err_MAR_MMDA[i] <- err_MAR_MMDA[i]+sqrt(mean((mu_hat - beta_true)^2))
+  }
+}
+
+err_MAR_MMDA <- err_MAR_MMDA/K
+err_MAR_MF <- err_MAR_MF/K
+err_MAR_MICE <- err_MAR_MICE/K
+err_MAR_SI <- err_MAR_SI/K
+err_MAR <- err_MAR/K
+```
+
+```{r, fig.width= 7, fig.height=5, out.width="80%"}
+#| label: fig-linMARimpute
+#| fig-cap: EM vs imputation + MLE for linear regression on MAR data.
+# Combine data into a data frame
+data_MAR <- data.frame(perc, err_MAR)
+
+data_MAR_MF <- data.frame(perc, err_MAR_MF)
+data_MAR_MMDA <- data.frame(perc, err_MAR_MMDA)
+data_MAR_SI <- data.frame(perc, err_MAR_SI)
+data_MAR_MICE <- data.frame(perc, err_MAR_MICE)
+size <- 0.8
+
+# Create ggplot objects
+plot_MAR <- ggplot(data_MAR, aes(x = perc, y = err_MAR)) +
+
+  geom_line(aes(color = "EM"), size = size)
+
+# Combine plots into a single figure with overlapped layers
+combined_plot <- plot_MAR +
+  geom_line(data = data_MAR_MF, aes(x = perc, y = err_MAR_MF, color = "MF"), size = size) + 
+
+  geom_line(data = data_MAR_MICE, aes(x = perc, y = err_MAR_MICE, color = "MICE"), size = size) +
+
+  geom_line(data = data_MAR_SI, aes(x = perc, y = err_MAR_SI, color = "SI"), size = size) +
+
+  geom_line(data = data_MAR_MMDA, aes(x = perc, y = err_MAR_MMDA, color = "MMDA"), size = size) +
+  
+  labs(title = expression(bold("RMSE obtained with EM vs. imputation + MLE, MAR mechanism")), x = "Proportion of Missing Data", y = "RMSE") +
+  scale_color_manual(values = c("red", "blue", "green", "black", "orange")) +
+  scale_fill_manual(values = c("red", "blue", "green", "black", "orange")) +
+  theme_minimal() +
+  scale_x_continuous(breaks = c(0.05, 0.25, 0.50, 0.70)) +
+  labs(color = "RMSE", fill = "Confidence Interval")
+
+# Print the combined plot
+print(combined_plot)
+```
+
+As we can see in @fig-linMARimpute, for the MAR mechanism, the results are very similar to those obtained in MCAR setting. In particular, the EM algorithm is again the best method. Between the four imputation packages, the worst-performing one for most percentages is $\texttt{softImpute}$, with the other three mostly showing very similar trends.
+
+**MNAR.** Now we perform the same experiment for datasets generated with the MNAR mechanism.
+
+```{r}
+#| output: false
+#| warning: false
+#| message: false
+# ---------------------- MNAR + LINEAR REGRESSION ------------------------
+K <- 20
+P <- 14
+err_MNAR_SI <- numeric(P)
+err_MNAR_MMDA <- numeric(P)
+err_MNAR_MF <- numeric(P)
+err_MNAR_MICE <- numeric(P)
+err_MNAR <- numeric(P)
+
+for (j in 1:K) {
+  X <- mvrnorm(n,mu.X,Sigma.X) 
+  y_complete <- cbind(rep(1, n), X) %*% beta_true + rnorm(n, 0, sigma_eps)
+  
+  for (i in 1:P) {
+    XproduceNA <- produce_NA(X, mechanism="MNAR", self.mask="lower", idx.incomplete = c(1,1,1,1), perc.missing=0.05*i)
+    XNA<-as.matrix(as.data.frame(XproduceNA$data.incomp))
+    
+    # EM
+    s <- prelim.norm(cbind(y_complete, XNA))
+    thetahat <- em.norm(s, showits = FALSE)
+    pars <- getparam.norm(s, thetahat)
+    b.est <- c(pars$mu[1] - pars$sigma[1,2:5] %*% solve(pars$sigma[2:5,2:5]) %*% pars$mu[2:5], 
+               pars$sigma[1,2:5] %*% solve(pars$sigma[2:5,2:5]))
+    err_MNAR[i] <- err_MNAR[i] + sqrt(mean((beta_true - b.est)^2))
+    
+    # softimpute
+    lambda_sft<-cv_sft(XNA) 
+    sft<-softImpute(x=XNA,lambda= lambda_sft) 
+    X.sft<-sft$u %*%diag(sft$d)%*%t(sft$v) 
+    X.sft[which(!is.na(XNA))] <- XNA[which(!is.na(XNA))] 
+    mu_hat <- lm(y_complete~X.sft)$coefficients
+    err_MNAR_SI[i] <- err_MNAR_SI[i]+sqrt(mean((mu_hat - beta_true)^2))
+    
+    # mice
+    mice_mice <- mice(data=XNA, m=5, method="pmm", printFlag = FALSE) #contains m=5 completed datasets.
+    IMP<-0 
+    for(h in 1:5){IMP<-IMP + mice::complete(mice_mice,h)} 
+    X.mice <- IMP/5 #5 is the default number of multiple imputations 
+    mu_hat <- lm(y_complete~as.matrix(X.mice))$coefficients
+    err_MNAR_MICE[i] <- err_MNAR_MICE[i]+sqrt(mean((mu_hat - beta_true)^2))
+    
+    # MissForest
+    forest<-missForest(xmis=XNA,maxiter=20,ntree=100)
+    X.forest<-forest$ximp  
+    mu_hat <- lm(y_complete~X.forest)$coefficients
+    err_MNAR_MF[i] <- err_MNAR_MF[i]+sqrt(mean((mu_hat - beta_true)^2))
+    
+    # MissMDA
+    pca<-imputePCA(X=XNA,ncp=2,scale=TRUE,method= c("Regularized","EM"))
+    ncp.pca<-estim_ncpPCA(XNA,method.cv="gcv")$ncp 
+    pca<-imputePCA(XNA,ncp=ncp.pca) 
+    X.pca<-pca$comp 
+    mu_hat <- lm(y_complete~X.pca)$coefficients
+    err_MNAR_MMDA[i] <- err_MNAR_MMDA[i]+sqrt(mean((mu_hat - beta_true)^2))
+  }
+}
+
+err_MNAR_MMDA <- err_MNAR_MMDA/K
+err_MNAR_MF <- err_MNAR_MF/K
+err_MNAR_MICE <- err_MNAR_MICE/K
+err_MNAR_SI <- err_MNAR_SI/K
+err_MNAR <- err_MNAR/K
+```
+
+```{r, fig.width= 7, fig.height=5, out.width="80%"}
+#| label: fig-linMNARimpute
+#| fig-cap: EM vs imputation + MLE for linear regression on MNAR data.
+# Combine data into a data frame
+data_MNAR <- data.frame(perc, err_MNAR)
+
+data_MNAR_MF <- data.frame(perc, err_MNAR_MF)
+data_MNAR_MMDA <- data.frame(perc, err_MNAR_MMDA)
+data_MNAR_SI <- data.frame(perc, err_MNAR_SI)
+data_MNAR_MICE <- data.frame(perc, err_MNAR_MICE)
+size <- 0.8
+
+# Create ggplot objects
+plot_MNAR <- ggplot(data_MNAR, aes(x = perc, y = err_MNAR)) +
+  geom_line(aes(color = "EM"), size = size)
+
+# Combine plots into a single figure with overlapped layers
+combined_plot <- plot_MNAR +
+  geom_line(data = data_MNAR_MF, aes(x = perc, y = err_MNAR_MF, color = "MF"), size = size) +
+
+  geom_line(data = data_MNAR_MICE, aes(x = perc, y = err_MNAR_MICE, color = "MICE"), size = size) +
+
+  geom_line(data = data_MNAR_SI, aes(x = perc, y = err_MNAR_SI, color = "SI"), size = size) +
+
+  geom_line(data = data_MNAR_MMDA, aes(x = perc, y = err_MNAR_MMDA, color = "MMDA"), size = size) +
+  
+  labs(title = expression(bold("RMSE obtained with EM vs. imputation + MLE, MNAR mechanism")), x = "Proportion of Missing Data", y = "RMSE") +
+  scale_color_manual(values = c("red", "blue", "green", "black", "orange")) +
+  scale_fill_manual(values = c("red", "blue", "green", "black", "orange")) +
+  theme_minimal() +
+  scale_x_continuous(breaks = c(0.05, 0.25, 0.50, 0.70)) +
+  labs(color = "RMSE", fill = "Confidence Interval")
+
+# Print the combined plot
+print(combined_plot)
+```
+
+@fig-linMNARimpute shows that, even in the case of the MNAR mechanism, the method that performs better in terms of RMSE is again the EM algorithm. For percentages of missingness up to around 40%, $\texttt{softImpute}$ is again the package performing the worst. Later on, the errors associated with the MLE estimates obtained after imputation methods plateau, apart from $\texttt{missMDA}$, for which the error keeps increasing until the 70% mark. Note that, despite EM being better than the rest, it still suffers from a higher error than in the MCAR and MAR cases, especially for higher percentages.
+
+**Final observations.** From the experimental results presented above, it is clear that in the linear regression setting with missing data, using the EM algorithm to estimate $\beta$ leads to better estimates compared to the those obtained with MLE after imputation, at least using the four packages we tried above. As we observed, in fact, for all the three mechanisms that generate NA's, EM outperforms the other approaches. Hence, we can argue that this is the best method to use for such a problem independently from the nature of the missingness in our data.
+
+### Logistic Regression
+
+Then, we proposed the same analysis for the logistic regression setting. We will see that the results will be quite different from the ones obtained in the context of linear regression. For these last experiments, we limit ourselves to $5\%-40\%$ of missing data to reduce the computational burden of this section. As we will see below, we can still obtain meaningful results in this range.
+
+**MCAR.** We now perform the experiment for logistic regression on a dataset generated with the MCAR mechanism. Here and for the next two experiments, the $n=150$ observations (we went down from 300 to 150 to cut computational costs) are generated from a multivariate normal distribution with $\mu=(1,2,3,4)^T, \Sigma=\begin{bmatrix} 1 & 0.5 & 0.5 & 0.5 \\ 0.5 & 1 & 0.5 & 0.5 \\ 0.5 & 0.5 & 1 & 0.5 \\ 0.5 & 0.5 & 0.5 & 1 \\ \end{bmatrix}$
+
+```{r}
+#|output: false
+# ---------------------- MCAR + LOGISTIC REGRESSION ------------------------
+set.seed(123)
+n <- 150
+p <- 4
+K <- 20
+P <- 8
+
+err_MCAR_SI <- numeric(P)
+err_MCAR_MMDA <- numeric(P)
+err_MCAR_MF <- numeric(P)
+err_MCAR_MICE <- numeric(P)
+err_MCAR <- numeric(P)
+
+perc <- numeric(P)
+beta_true <- c(0, 1, -1, 1, -1)
+
+for (j in 1:K) {
+  mu.X <- rep(1, p) 
+  Sigma.X <- diag(0.5,ncol=p,nrow=p)+matrix(0.5,nrow=p,ncol= p) 
+  X <- mvrnorm(n,mu.X,Sigma.X) 
+
+  # Response vector
+  p1 <- 1/(1+exp(-X%*%beta_true[-1]-beta_true[1]))
+  y_complete <- as.numeric(runif(n)<p1)
+  
+  for (i in 1:P) {
+    XproduceNA <- produce_NA(X,mechanism="MCAR",perc.missing= 0.05*i) 
+    XNA<-as.data.frame(XproduceNA$data.incomp)
+    perc[i] <- 0.05*i
+    
+    # EM
+    miss.list = miss.glm(y_complete~as.matrix(XNA), print_iter = FALSE, seed=100)
+    err_MCAR[i] <- err_MCAR[i] + sqrt(mean((miss.list$coefficients-beta_true)^2))
+    
+    XNA <- as.matrix(as.data.frame(XproduceNA$data.incomp))
+    # softimpute
+    lambda_sft<-cv_sft(XNA) 
+    sft<-softImpute(x=XNA,lambda= lambda_sft) 
+    X.sft<-sft$u %*%diag(sft$d)%*%t(sft$v) 
+    X.sft[which(!is.na(XNA))] <- XNA[which(!is.na(XNA))] 
+    mu_hat <- glm(y_complete~X.sft, family = "binomial")$coefficients
+    err_MCAR_SI[i] <- err_MCAR_SI[i] + sqrt(mean((mu_hat - beta_true)^2))
+    
+    # mice
+    mice_mice <- mice(data=XNA, m=5, method="pmm", printFlag = FALSE) #contains m=5 completed datasets.
+    IMP<-0 
+    for(h in 1:5){IMP<-IMP + mice::complete(mice_mice,h)} 
+    X.mice <- IMP/5 #5 is the default number of multiple imputations 
+    mu_hat <- glm(y_complete~as.matrix(X.mice), family = "binomial")$coefficients
+    err_MCAR_MICE[i] <- err_MCAR_MICE[i]+sqrt(mean((mu_hat - beta_true)^2))
+    
+    # MissForest
+    forest<-missForest(xmis=XNA,maxiter=20,ntree=100)
+    X.forest<-forest$ximp  
+    mu_hat <- glm(y_complete~X.forest, family = "binomial")$coefficients
+    err_MCAR_MF[i] <- err_MCAR_MF[i]+sqrt(mean((mu_hat - beta_true)^2))
+    
+    # MissMDA
+    pca<-imputePCA(X=XNA,ncp=2,scale=TRUE,method= c("Regularized","EM"))
+    ncp.pca<-estim_ncpPCA(XNA,method.cv="gcv")$ncp 
+    pca<-imputePCA(XNA,ncp=ncp.pca) 
+    X.pca<-pca$comp 
+    mu_hat <- glm(y_complete~X.pca, family = "binomial")$coefficients
+    err_MCAR_MMDA[i] <- err_MCAR_MMDA[i]+sqrt(mean((mu_hat - beta_true)^2))
+  }
+}
+
+err_MCAR_MMDA <- err_MCAR_MMDA/K
+err_MCAR_MF <- err_MCAR_MF/K
+err_MCAR_MICE <- err_MCAR_MICE/K
+err_MCAR_SI <- err_MCAR_SI/K
+err_MCAR <- err_MCAR/K
+```
+
+```{r, fig.width= 7, fig.height=5, out.width="80%"}
+#| label: fig-logMCARimputetwo
+#| fig-cap: EM vs imputation + MLE for logistic regression on MCAR data.
+# Combine data into a data frame
+data_MCAR <- data.frame(perc, err_MCAR)
+data_MCAR_MF <- data.frame(perc, err_MCAR_MF)
+data_MCAR_MMDA <- data.frame(perc, err_MCAR_MMDA)
+data_MCAR_SI <- data.frame(perc, err_MCAR_SI)
+data_MCAR_MICE <- data.frame(perc, err_MCAR_MICE)
+size <- 0.8
+
+# Create ggplot objects
+plot_MCAR <- ggplot(data_MCAR, aes(x = perc, y = err_MCAR)) +
+  geom_line(aes(color = "EM"), size = size)
+
+# Combine plots into a single figure with overlapped layers
+combined_plot <- plot_MCAR +
+  geom_line(data = data_MCAR_MF, aes(x = perc, y = err_MCAR_MF, color = "MF"), size = size) +
+
+  geom_line(data = data_MCAR_MICE, aes(x = perc, y = err_MCAR_MICE, color = "MICE"), size = size) +
+
+  geom_line(data = data_MCAR_SI, aes(x = perc, y = err_MCAR_SI, color = "SI"), size = size) +
+
+  geom_line(data = data_MCAR_MMDA, aes(x = perc, y = err_MCAR_MMDA, color = "MMDA"), size = size) +
+  
+  labs(title =expression(bold("RMSE obtained with EM vs. imputation + MLE, MCAR mechanism")), x = "Proportion of Missing Data", y = "RMSE") +
+  scale_color_manual(values = c("red", "blue", "green", "black", "orange")) +
+  scale_fill_manual(values = c("red", "blue", "green", "black", "orange")) +
+  theme_minimal() +
+  scale_x_continuous(breaks = c(0.05, 0.15, 0.30, 0.40)) +
+  labs(color = "RMSE", fill = "Confidence Interval")
+
+# Print the combined plot
+print(combined_plot)
+```
+
+@fig-logMCARimputetwo shows that the EM algorithm is the worst method to use in this setting, since all four imputation methods we tried performed better (on average) for all percentages. The four imputation methods gave similar results in terms of RMSE. We now proceed with the same experiments with MAR and MNAR data to see whether the same behavior holds, and later make some final remarks about the logistic regression setting.
+
+**MAR.**
+
+```{r}
+#|output: false
+# ---------------------- MAR + LOGISTIC REGRESSION ------------------------
+set.seed(1)
+P <- 8
+K <- 20
+
+err_MAR_SI <- numeric(P)
+err_MAR_MMDA <- numeric(P)
+err_MAR_MF <- numeric(P)
+err_MAR_MICE <- numeric(P)
+err_MAR <- numeric(P)
+
+for (j in 1:K) {
+  mu.X <- rep(1, p) 
+  Sigma.X <- diag(0.5,ncol=p,nrow=p)+matrix(0.5,nrow=p,ncol= p) 
+  X <- mvrnorm(n,mu.X,Sigma.X) 
+  
+  # Response vector
+  p1 <- 1/(1+exp(-X%*%beta_true[-1]-beta_true[1]))
+  y_complete <- as.numeric(runif(n)<p1)
+  
+  for (i in 1:P) {
+    XproduceNA <- produce_NA(X,mechanism="MAR",perc.missing= 0.05*i) 
+    XNA<-as.data.frame(XproduceNA$data.incomp)
+    perc[i] <- 0.05*i
+    
+    # EM
+    miss.list = miss.glm(y_complete~as.matrix(XNA), print_iter = FALSE)
+    err_MAR[i] <- err_MAR[i] + sqrt(mean((miss.list$coefficients-beta_true)^2))
+    XNA <- as.matrix(as.data.frame(XproduceNA$data.incomp))
+    
+    # softimpute
+    lambda_sft<-cv_sft(XNA) 
+    sft<-softImpute(x=XNA,lambda= lambda_sft) 
+    X.sft<-sft$u %*%diag(sft$d)%*%t(sft$v) 
+    X.sft[which(!is.na(XNA))] <- XNA[which(!is.na(XNA))] 
+    mu_hat <- glm(y_complete~X.sft, family = "binomial")$coefficients
+    err_MAR_SI[i] <- err_MAR_SI[i]+sqrt(mean((mu_hat - beta_true)^2))
+    
+    # mice
+    mice_mice <- mice(data=XNA, m=5, method="pmm", printFlag = FALSE) #contains m=5 completed datasets.
+    IMP<-0 
+    for(h in 1:5){IMP<-IMP + mice::complete(mice_mice,h)} 
+    X.mice <- IMP/5 #5 is the default number of multiple imputations 
+    mu_hat <- glm(y_complete~as.matrix(X.mice), family = "binomial")$coefficients
+    err_MAR_MICE[i] <- err_MAR_MICE[i]+sqrt(mean((mu_hat - beta_true)^2))
+    
+    # MissForest
+    forest<-missForest(xmis=XNA,maxiter=20,ntree=100)
+    X.forest<-forest$ximp  
+    mu_hat <- glm(y_complete~X.forest, family = "binomial")$coefficients
+    err_MAR_MF[i] <- err_MAR_MF[i]+sqrt(mean((mu_hat - beta_true)^2))
+    
+    # MissMDA
+    pca<-imputePCA(X=XNA,ncp=2,scale=TRUE,method= c("Regularized","EM"))
+    ncp.pca<-estim_ncpPCA(XNA,method.cv="gcv")$ncp 
+    pca<-imputePCA(XNA,ncp=ncp.pca) 
+    X.pca<-pca$comp 
+    mu_hat <- glm(y_complete~X.pca, family = "binomial")$coefficients
+    err_MAR_MMDA[i] <- err_MAR_MMDA[i]+sqrt(mean((mu_hat - beta_true)^2))
+  }
+}
+
+err_MAR_MMDA <- err_MAR_MMDA/K
+err_MAR_MF <- err_MAR_MF/K
+err_MAR_MICE <- err_MAR_MICE/K
+err_MAR_SI <- err_MAR_SI/K
+err_MAR <- err_MAR/K
+```
+
+```{r, fig.width= 7, fig.height=5, out.width="80%"}
+#| label: fig-logMARimpute
+#| fig-cap: EM vs imputation + MLE for logistic regression on MAR data.
+# Combine data into a data frame
+data_MAR <- data.frame(perc, err_MAR)
+data_MAR_MF <- data.frame(perc, err_MAR_MF)
+data_MAR_MMDA <- data.frame(perc, err_MAR_MMDA)
+data_MAR_SI <- data.frame(perc, err_MAR_SI)
+data_MAR_MICE <- data.frame(perc, err_MAR_MICE)
+size <- 0.8
+
+# Create ggplot objects
+plot_MAR <- ggplot(data_MAR, aes(x = perc, y = err_MAR)) +
+  geom_line(aes(color = "EM"), size = size)
+
+# Combine plots into a single figure with overlapped layers
+combined_plot <- plot_MAR +
+  geom_line(data = data_MAR_MF, aes(x = perc, y = err_MAR_MF, color = "MF"), size = size) +
+  
+  geom_line(data = data_MAR_MICE, aes(x = perc, y = err_MAR_MICE, color = "MICE"), size = size) +
+
+  geom_line(data = data_MAR_SI, aes(x = perc, y = err_MAR_SI, color = "SI"), size = size) +
+
+  geom_line(data = data_MAR_MMDA, aes(x = perc, y = err_MAR_MMDA, color = "MMDA"), size = size) +
+  
+  labs(title = expression(bold("RMSE obtained with EM vs. imputation + MLE, MAR mechanism")), x = "Proportion of Missing Data", y = "RMSE") +
+  scale_color_manual(values = c("red", "blue", "green", "black", "orange")) +
+  scale_fill_manual(values = c("red", "blue", "green", "black", "orange")) +
+  theme_minimal() +
+  scale_x_continuous(breaks = c(0.05, 0.15, 0.30, 0.40)) +
+  labs(color = "RMSE", fill = "Confidence Interval")
+
+# Print the combined plot
+print(combined_plot)
+```
+
+From @fig-logMARimpute, we can observe that in this case, for percentages up to $30\%$, the performance of the EM algorithm (on average) is comparable with that of MLE after imputation methods, but never better. For higher percentages $(35\%, 40\%)$, we get instead a much worse RMSE.
+
+**MNAR.**
+
+```{r}
+#| output: false
+# ---------------------- MNAR + LOGISTIC REGRESSION ------------------------
+set.seed(1)
+n <- 150
+p <- 4
+P <- 8
+K <- 20
+  
+err_MNAR_SI <- numeric(P)
+err_MNAR_MMDA <- numeric(P)
+err_MNAR_MF <- numeric(P)
+err_MNAR_MICE <- numeric(P)
+err_MNAR <- numeric(P)
+
+for (j in 1:K) {
+  mu.X <- rep(1, p) 
+  Sigma.X <- diag(0.5,ncol=p,nrow=p)+matrix(0.5,nrow=p,ncol= p) 
+  X <- mvrnorm(n,mu.X,Sigma.X) 
+  
+  # Response vector
+  p1 <- 1/(1+exp(-X%*%beta_true[-1]-beta_true[1]))
+  y_complete <- as.numeric(runif(n)<p1)
+  
+  for (i in 1:P) {
+    XproduceNA <- produce_NA(X, mechanism="MNAR", self.mask="lower", idx.incomplete = c(1,1,1,1), perc.missing=0.05*i) 
+    XNA<-as.data.frame(XproduceNA$data.incomp)
+    perc[i] <- 0.05*i
+    
+    # EM
+    miss.list = miss.glm(y_complete~as.matrix(XNA), print_iter = FALSE, seed=100)
+    err_MNAR[i] <- err_MNAR[i] + sqrt(mean((miss.list$coefficients-beta_true)^2))
+    
+    XNA <- as.matrix(as.data.frame(XproduceNA$data.incomp))
+    
+    # softimpute
+    lambda_sft<-cv_sft(XNA) 
+    sft<-softImpute(x=XNA,lambda= lambda_sft) 
+    X.sft<-sft$u %*%diag(sft$d)%*%t(sft$v) 
+    X.sft[which(!is.na(XNA))] <- XNA[which(!is.na(XNA))] 
+    mu_hat <- glm(y_complete~X.sft, family = "binomial")$coefficients
+    err_MNAR_SI[i] <- err_MNAR_SI[i]+sqrt(mean((mu_hat - beta_true)^2))
+    
+    # mice
+    mice_mice <- mice(data=XNA, m=5, method="pmm", printFlag = FALSE) #contains m=5 completed datasets.
+    IMP<-0 
+    for(h in 1:5){IMP<-IMP + mice::complete(mice_mice,h)} 
+    X.mice <- IMP/5 #5 is the default number of multiple imputations 
+    mu_hat <- glm(y_complete~as.matrix(X.mice), family = "binomial")$coefficients
+    err_MNAR_MICE[i] <- err_MNAR_MICE[i]+sqrt(mean((mu_hat - beta_true)^2))
+    
+    # MissForest
+    forest<-missForest(xmis=XNA,maxiter=20,ntree=100)
+    X.forest<-forest$ximp  
+    mu_hat <- glm(y_complete~X.forest, family = "binomial")$coefficients
+    err_MNAR_MF[i] <- err_MNAR_MF[i]+sqrt(mean((mu_hat - beta_true)^2))
+    
+    # MissMDA
+    pca<-imputePCA(X=XNA,ncp=2,scale=TRUE,method= c("Regularized","EM"))
+    ncp.pca<-estim_ncpPCA(XNA,method.cv="gcv")$ncp 
+    pca<-imputePCA(XNA,ncp=ncp.pca) 
+    X.pca<-pca$comp 
+    mu_hat <- glm(y_complete~X.pca, family = "binomial")$coefficients
+    err_MNAR_MMDA[i] <- err_MNAR_MMDA[i]+sqrt(mean((mu_hat - beta_true)^2))
+  }
+}
+
+err_MNAR_MMDA <- err_MNAR_MMDA/K
+err_MNAR_MF <- err_MNAR_MF/K
+err_MNAR_MICE <- err_MNAR_MICE/K
+err_MNAR_SI <- err_MNAR_SI/K
+err_MNAR <- err_MNAR/K
+```
+
+```{r, fig.width= 7, fig.height=5, out.width="80%"}
+#| label: fig-logMNARimpute
+#| fig-cap: EM vs imputation + MLE for logistic regression on MNAR data.
+# Combine data into a data frame
+data_MNAR <- data.frame(perc, err_MNAR)
+data_MNAR_MF <- data.frame(perc, err_MNAR_MF)
+data_MNAR_MMDA <- data.frame(perc, err_MNAR_MMDA)
+data_MNAR_SI <- data.frame(perc, err_MNAR_SI)
+data_MNAR_MICE <- data.frame(perc, err_MNAR_MICE)
+size <- 0.8
+
+# Create ggplot objects
+plot_MNAR <- ggplot(data_MNAR, aes(x = perc, y = err_MNAR)) +
+  geom_line(aes(color = "EM"), size = size)
+
+# Combine plots into a single figure with overlapped layers
+combined_plot <- plot_MNAR +
+  geom_line(data = data_MNAR_MF, aes(x = perc, y = err_MNAR_MF, color = "MF"), size = size) +
+
+  geom_line(data = data_MNAR_MICE, aes(x = perc, y = err_MNAR_MICE, color = "MICE"), size = size) +
+
+  geom_line(data = data_MNAR_SI, aes(x = perc, y = err_MNAR_SI, color = "SI"), size = size) +
+
+  geom_line(data = data_MNAR_MMDA, aes(x = perc, y = err_MNAR_MMDA, color = "MMDA"), size = size) +
+  
+  labs(title = expression(bold("RMSE obtained with EM vs. imputation + MLE, MNAR mechanism")), x = "Proportion of Missing Data", y = "RMSE") +
+  scale_color_manual(values = c("red", "blue", "green", "black", "orange")) +
+  scale_fill_manual(values = c("red", "blue", "green", "black", "orange")) +
+  theme_minimal() +
+  scale_x_continuous(breaks = c(0.05, 0.15, 0.30, 0.40)) +
+  labs(color = "RMSE", fill = "Confidence Interval")
+
+# Print the combined plot
+print(combined_plot)
+```
+
+@fig-logMNARimpute indicates that the performance of EM algorithm is again similar to that of imputation + MLE, apart from when imputation is performed with $\texttt{softImpute}$, in which case we get the best results by a margin.
+
+**Final observations.** From the experimental results presented above, it is clear that in the logistic regression setting with missing data, using the stochastic approximation of the EM algorithm is not the ideal choice. In fact, independently of the mechanism and percentages that generate missingness, EM is never the best choice in terms of RMSE obtained. This difference from the linear regression case could be due to the fact that, as mentioned in @sec-logone, in this case we don't have a closed form solution for the expectation step and thus we resort to use a Monte Carlo version of EM. This algorithm is also quite expensive, and thus it seems not advisable to use it, at least when imputation options are available.
+
+### Comparison and observations
+
+The results obtained in this section are interesting. We observed that the performances of EM compared to the one of maximum likelihood estimation after imputation is more task-dependent than mechanism-dependent. In the previous two subsections, in fact, we observed that EM was the best method for linear regression but one of the worst one for logistic regression.
+
+# Conclusion
+
+In this project, we performed several numerical experiments to investigate how the Expectation-Maximization algorithm behaves in various contexts with missing data. The incomplete datasets were generated using three different mechanisms - MCAR, MAR, and MNAR - and varying percentages of missing data.
+
+In @sec-section1 and @sec-section2 we tackled the following question: *When you are faced with missing data, when is the EM algorithm a good option for statistical inference (the estimation process)?*
+
+In @sec-section1, we studied this question in three different frameworks: mean and covariance estimation of multivariate normal distribution, linear regression, and logistic regression. Through the experiments above, we observed that the EM algorithm's performance varies widely depending on the mechanism through which the missing data is generated. In particular, we argue that the EM algorithm is quite effective in the case MCAR data, independently of the framework we are working in. In fact, in this case the RMSE stays relatively low for all the tasks we tried and even for high percentage of missing data. The performance is a bit worse for the MAR setting, especially for large proportion of missingness. Finally, the MNAR mechanism is the one that hurts the estimation process the most, with the RMSE being way higher than the other two settings. Again, it is crucial to consider that the different ways of generating MAR and MNAR data are endless. What we showed is that if data is MAR and MNAR, performance can be heavily affected. We do not claim, on the other hand, that it would be affected in the same way for all MAR and MNAR scenarios. As we showed in @sec-depthone, in fact, performance in the case of MAR data can be similar to MCAR when the correlations between variables is low.
+
+Another interesting question that arose from this study of the EM algorithm in the context of missing data is whether this algorithm outperforms usual imputation methods combined with maximum likelihood estimation. We observed that the algorithm outperforms maximum likelihood estimation after imputation in terms of RMSE in the linear regression problem. On the other hand, when dealing with logistic regression, the SAEM algorithm seems to be the worst choice you can make among the ones analyzed. Thus, we argue that there is no method that gets the lowest error for all tasks in which missing data is present. Instead, a case-by-case analysis needs to be done, and the result can change depending on the problem.
+
+Summarizing, we observed that the EM algorithm is in general a good choice when dealing with missing values in a design matrix $X$, but the error obtained by its estimates depends on the missing data generating process we are dealing with. We also showed that EM is not always preferable to imputation followed by standard maximum likelihood estimation. Further directions of research could be to try the EM algorithm on incomplete datasets generated with different MAR and MNAR mechanisms and / or apply the EM algorithm to different frameworks.
+
+\newpage
+
+# References
